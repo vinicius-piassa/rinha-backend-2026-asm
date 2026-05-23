@@ -1,0 +1,75 @@
+x-asm: &asm
+  image: ghcr.io/vinicius-piassa/rinha-backend-2026-asm:latest
+  platform: linux/amd64
+  restart: unless-stopped
+  networks:
+    - rinha-net
+  ulimits:
+    memlock: -1
+    nofile:
+      soft: 65535
+      hard: 65535
+
+services:
+  api1:
+    <<: *asm
+    command:
+      - /asm_server
+      - /sockets/api1.sock
+      - /index.bin
+    volumes:
+      - sockets:/sockets
+    cpuset: "0,1"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.44"
+          memory: "156MB"
+
+  api2:
+    <<: *asm
+    command:
+      - /asm_server
+      - /sockets/api2.sock
+      - /index.bin
+    volumes:
+      - sockets:/sockets
+    cpuset: "2,3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.44"
+          memory: "156MB"
+
+  lb:
+    <<: *asm
+    command:
+      - /asm_lb
+      - "9999"
+      - /sockets/api1.sock
+      - /sockets/api2.sock
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    cpuset: "0,2"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.12"
+          memory: "32MB"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,mode=0777
+
+networks:
+  rinha-net:
+    driver: bridge
