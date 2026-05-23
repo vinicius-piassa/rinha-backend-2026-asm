@@ -1,0 +1,10 @@
+.git
+.gitignore
+asm/build/
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+info.json
+scripts/
+*.md

@@ -1,0 +1,126 @@
+# Rinha 2026 — pure-asm fraud detection stack.
+#
+# Topology:  LB :9999 → SCM_RIGHTS → asm_server × 2 (via Unix-socket ctrl channel)
+#
+# Resource budget (Rinha rule: total ≤ 1 CPU + 350 MB):
+#   lb   : 0.050 CPU /  30 MB   (TCP accept + sendmsg, no payload touch; LB sits at <1% CPU under stress, so any quota we give it is wasted)
+#   api1 : 0.475 CPU / 160 MB   (87 MB index mmap + buffers + epoll state)
+#   api2 : 0.475 CPU / 160 MB
+#   -----  total: 1.000 CPU / 350 MB
+#
+# Per-service `cpuset` pins each API to a dedicated physical core (both SMT
+# threads) on the 2-core Mac Mini target; LB scavenges any free core.
+#
+# The Unix sockets for the LB ↔ API control channel live on a shared volume
+# so both APIs can be reached from the LB by path.
+
+x-asm: &asm
+  # `build:` is what lets the Rinha CI come up via plain `docker compose up
+  # -d` — there's no pre-built image on a public registry to pull from.
+  # `image:` is just the tag the locally-built image gets so the LB and the
+  # two APIs share the same layers instead of re-building three times.
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: rinha-asm:latest
+  restart: unless-stopped
+  # Rinha rule: "Modo de rede deve ser bridge.  Modo host e privileged não são
+  # permitidos."  We satisfy it explicitly:
+  #   - all services attach to the `rinha-net` network declared below as
+  #     driver: bridge (see `networks:` at the bottom of this file);
+  #   - no `network_mode: host`, no `privileged: true`, no `pid:`/`ipc:`/
+  #     `userns_mode: host`, no `security_opt`, no `devices`;
+  #   - `cap_add` only enumerates individual capabilities (IPC_LOCK, SYS_NICE)
+  #     which is NOT the same as privileged mode.
+  networks:
+    - rinha-net
+  # Only IPC_LOCK is added — needed by mlockall() to keep the 87 MB index in
+  # RAM under memory pressure.  SYS_NICE / SCHED_FIFO was intentionally NOT
+  # granted: in a 2-core contended environment (Mac Mini) it caused the asm
+  # server to outrank the k6 client + kernel softirq queue, INFLATING p99
+  # rather than cutting it.
+  cap_add:
+    - IPC_LOCK
+  ulimits:
+    memlock: -1
+    nofile: 65535
+  # Per-container net tuning.  All of these are namespaced and don't need
+  # privileged mode.  Effects:
+  #   tcp_low_latency=1   — kernel favours min-latency over throughput in
+  #                         the SACK / pacing decisions on loopback/bridge.
+  #   busy_read / busy_poll = 50  — kernel busy-polls a packet for up to
+  #                                 50 µs before sleeping; spends CPU but
+  #                                 cuts wake-up latency at p99.  We have
+  #                                 ~95 % CPU idle so the cost is hidden.
+  #   tcp_notsent_lowat=128  — same effect as TCP_NOTSENT_LOWAT setsockopt
+  #                            but applied to every socket without code change.
+  # Net sysctls intentionally NOT set here.  Docker's "unsafe procfs"
+  # guard rejects net.core.* and net.ipv4.tcp_low_latency even though
+  # the files exist on the host kernel — they're considered globally
+  # shared rather than per-namespace.  The equivalent effect we'd want
+  # from tcp_notsent_lowat is already applied per-socket via the
+  # TCP_NOTSENT_LOWAT setsockopt in setup_client_fd.  Busy-poll would
+  # need privileged mode.
+
+services:
+  api1:
+    <<: *asm
+    command:
+      - /asm_server
+      - /sockets/api1.sock
+      - /index.bin
+    volumes:
+      - sockets:/sockets
+    # Pin to physical core 0 (both SMT threads of it).  Keeps L1/L2 hot
+    # and prevents core migration on the Mac Mini (2-core Haswell).
+    # `cpuset` is placement, NOT a quota — `limits.cpus` is still the budget.
+    cpuset: "0,1"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: "160MB"
+
+  api2:
+    <<: *asm
+    command:
+      - /asm_server
+      - /sockets/api2.sock
+      - /index.bin
+    volumes:
+      - sockets:/sockets
+    cpuset: "2,3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.475"
+          memory: "160MB"
+
+  lb:
+    <<: *asm
+    command:
+      - /asm_lb
+      - "9999"
+      - /sockets/api1.sock
+      - /sockets/api2.sock
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    # LB uses < 1% CPU under load — let it scavenge whichever core is free.
+    cpuset: "0,1,2,3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "30MB"
+
+volumes:
+  sockets:
+
+networks:
+  rinha-net:
+    driver: bridge

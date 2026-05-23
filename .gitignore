@@ -1,0 +1,6 @@
+asm/build/
+*.o
+*.bin
+!/index.bin
+*.swp
+.DS_Store

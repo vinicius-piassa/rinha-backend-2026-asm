@@ -1,0 +1,7 @@
+{
+    "participants": ["Vinicius Piassa"],
+    "social": ["https://github.com/vinicius-piassa"],
+    "source-code-repo": "https://github.com/vinicius-piassa/rinha-backend-2026-asm",
+    "stack": ["x86-64 nasm", "Linux syscalls", "no-libc", "no-framework"],
+    "open_to_work": false
+}
