@@ -3,16 +3,13 @@
 # Topology:  LB :9999 → SCM_RIGHTS → asm_server × 2 (via Unix-socket ctrl channel)
 #
 # Resource budget (Rinha rule: total ≤ 1 CPU + 350 MB):
-#   lb   : 0.050 CPU /  30 MB   (TCP accept + sendmsg, no payload touch; LB sits at <1% CPU under stress, so any quota we give it is wasted)
-#   api1 : 0.475 CPU / 160 MB   (87 MB index mmap + buffers + epoll state)
-#   api2 : 0.475 CPU / 160 MB
+#   lb   : 0.100 CPU /  30 MB   
+#   api1 : 0.450 CPU / 160 MB   (87 MB index mmap + buffers + epoll state)
+#   api2 : 0.450 CPU / 160 MB
 #   -----  total: 1.000 CPU / 350 MB
 #
 # Per-service `cpuset` pins each API to a dedicated physical core (both SMT
-# threads) on the 2-core Mac Mini target; LB scavenges any free core.
-#
-# The Unix sockets for the LB ↔ API control channel live on a shared volume
-# so both APIs can be reached from the LB by path.
+# threads) on the 2-core Mac Mini target.
 
 x-asm: &asm
   build:
@@ -41,7 +38,6 @@ services:
     volumes:
       - sockets:/sockets
     cpuset: "0,1"
-    oom_score_adj: -1000
     deploy:
       resources:
         limits:
@@ -57,7 +53,6 @@ services:
     volumes:
       - sockets:/sockets
     cpuset: "2,3"
-    oom_score_adj: -1000
     deploy:
       resources:
         limits:
@@ -79,8 +74,6 @@ services:
       - api1
       - api2
     cpuset: "0,2"
-    sysctls:
-      - net.core.somaxconn=65535
     deploy:
       resources:
         limits:
@@ -98,5 +91,4 @@ volumes:
 networks:
   rinha-net:
     driver: bridge
-    driver_opts:
-      com.docker.network.driver.mtu: 65535
+    
