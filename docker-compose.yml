@@ -41,6 +41,7 @@ services:
     volumes:
       - sockets:/sockets
     cpuset: "0,1"
+    oom_score_adj: -1000
     deploy:
       resources:
         limits:
@@ -56,6 +57,7 @@ services:
     volumes:
       - sockets:/sockets
     cpuset: "2,3"
+    oom_score_adj: -1000
     deploy:
       resources:
         limits:
@@ -67,3 +69,34 @@ services:
     command:
       - /asm_lb
       - "9999"
+      - /sockets/api1.sock
+      - /sockets/api2.sock
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    cpuset: "0,2"
+    sysctls:
+      - net.core.somaxconn=65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4m,mode=0777
+
+networks:
+  rinha-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 65535
