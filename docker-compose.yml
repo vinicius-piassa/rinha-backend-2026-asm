@@ -24,9 +24,6 @@ x-asm: &asm
   ulimits:
     memlock: -1
     nofile: 65535
-  security_opt:
-    - seccomp=unconfined
-    - apparmor=unconfined
 
 services:
   api1:
@@ -91,4 +88,3 @@ volumes:
 networks:
   rinha-net:
     driver: bridge
-    
