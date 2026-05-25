@@ -130,6 +130,7 @@
 %define IORING_SETUP_SQPOLL        (1 << 1)
 %define IORING_SETUP_CQSIZE        (1 << 3)
 %define IORING_SETUP_CLAMP         (1 << 4)
+%define IORING_SETUP_SUBMIT_ALL    (1 << 7)
 %define IORING_SETUP_SINGLE_ISSUER (1 << 12)
 %define IORING_SETUP_COOP_TASKRUN  (1 << 8)
 %define IORING_SETUP_DEFER_TASKRUN (1 << 13)
@@ -137,10 +138,11 @@
 ; ===========================================================================
 ; io_uring_enter flags
 ; ===========================================================================
-%define IORING_ENTER_GETEVENTS     (1 << 0)
-%define IORING_ENTER_SQ_WAKEUP     (1 << 1)
-%define IORING_ENTER_SQ_WAIT       (1 << 2)
-%define IORING_ENTER_EXT_ARG       (1 << 3)
+%define IORING_ENTER_GETEVENTS         (1 << 0)
+%define IORING_ENTER_SQ_WAKEUP         (1 << 1)
+%define IORING_ENTER_SQ_WAIT           (1 << 2)
+%define IORING_ENTER_EXT_ARG           (1 << 3)
+%define IORING_ENTER_REGISTERED_RING   (1 << 4)
 
 ; ===========================================================================
 ; io_uring_register opcodes
@@ -151,6 +153,17 @@
 %define IORING_UNREGISTER_FILES    3
 %define IORING_REGISTER_PBUF_RING  22   ; provided buffer ring
 %define IORING_UNREGISTER_PBUF_RING 23
+%define IORING_REGISTER_RING_FDS   20   ; register ring fd for fast enter
+%define IORING_UNREGISTER_RING_FDS 21
+
+; struct io_uring_rsrc_update — 16 bytes; used for IORING_REGISTER_RING_FDS.
+; { u32 offset; u32 resv; u64 data; }  Caller writes offset=-1U to ask the
+; kernel to assign the next free slot; on success offset is overwritten with
+; the assigned index.  data is the file descriptor being registered.
+%define RSRC_UPDATE_OFFSET      0    ; u32
+%define RSRC_UPDATE_RESV        4    ; u32
+%define RSRC_UPDATE_DATA        8    ; u64
+%define RSRC_UPDATE_SIZE        16
 
 ; ===========================================================================
 ; Provided-buffer-ring (IORING_REGISTER_PBUF_RING) struct io_uring_buf_reg
@@ -216,7 +229,8 @@
 %define URING_SQ_RING_SIZE      88   ; u32 — bytes for munmap
 %define URING_SQES_SIZE         92   ; u32
 %define URING_SQ_TAIL_CACHED    96   ; u32 — local copy of tail for batching
-%define URING_PAD               100  ; 28 bytes pad → 128 total
+%define URING_REG_FD            100  ; s32 — registered ring index, -1 if none
+%define URING_PAD               104  ; 24 bytes pad → 128 total
 %define URING_SIZE              128
 
 ; ===========================================================================

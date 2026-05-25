@@ -23,6 +23,20 @@ default rel
 
 %include "syscalls.inc"
 %include "macros.inc"
+%include "trace.inc"
+
+; ---- Sub-phase instrumentation (read by server.asm dump) ------------------
+; Defined here (instead of in server.asm) so the TRACE macros below address
+; them directly without needing extern.  Both are linked as ordinary globals.
+section .bss
+alignb 64
+global g_search_cp_sum, g_search_pick_sum, g_search_pick_count
+global g_search_scan_sum, g_search_scan_count
+g_search_cp_sum:        resq 1    ; sum of compute_cluster_packed cycles
+g_search_pick_sum:      resq 1    ; sum of pick_min_cluster cycles
+g_search_pick_count:    resq 1    ; total pick_min_cluster calls
+g_search_scan_sum:      resq 1    ; sum of scan_cluster cycles
+g_search_scan_count:    resq 1    ; total scan_cluster calls
 
 ; ---- IvfIndex struct layout ------------------------------------------------
 %define IX_FD                0    ; int      (+4 pad)
@@ -225,6 +239,7 @@ scan_cluster:
 
     xor     rcx, rcx                       ; i = 0 (vector index, batches of 8)
 
+    align   32                              ; let DSB capture the hot loop body
 .batch:
     cmp     rcx, rbp
     jae     .done
@@ -400,6 +415,8 @@ scan_cluster:
 %define SS_WORST_KEY        16608
 %define SS_Q                16616
 %define SS_MAX_PROBES       16624
+%define SS_TSC              16640       ; instrumentation scratch (8 B)
+%define SS_RET_STASH        16648       ; pick_min return stash (8 B)
 %define FRAME_SIZE          16704       ; sub rsp, + slack for `and rsp, -32`
 
 global search_core
@@ -444,12 +461,16 @@ search_core:
 %endrep
 
     ; Phase 1: compute_cluster_packed(q, bmin, bmax, n_clusters, out)
+    ; Bracket with rdtscp.  Scratch slot at [rsp + 16640] (within the unused
+    ; tail of FRAME_SIZE = 16704; SS_MAX_PROBES ends at 16628).
+    TRACE_TSC qword [rsp + 16640]
     mov     rdi, rsi
     mov     rsi, [rbx + IX_BBOX_MIN]
     mov     rdx, [rbx + IX_BBOX_MAX]
     mov     ecx, [rbx + IX_N_CLUSTERS]
     lea     r8, [rsp + SS_CLUSTER_PACKED]
     call    compute_cluster_packed
+    TRACE_PHASE_SUM g_search_cp_sum, qword [rsp + 16640]
 
     xor     r15d, r15d                     ; probe_count
 
@@ -457,9 +478,14 @@ search_core:
     cmp     r15d, [rsp + SS_MAX_PROBES]
     jge     .done
 
+    TRACE_TSC qword [rsp + 16640]
     lea     rdi, [rsp + SS_CLUSTER_PACKED]
     mov     esi, [rbx + IX_N_CLUSTERS]
     call    pick_min_cluster               ; rax = best_packed
+    mov     [rsp + 16648], rax             ; stash pick return across TRACE clobber
+    TRACE_PHASE_SUM g_search_pick_sum, qword [rsp + 16640]
+    inc     qword [rel g_search_pick_count]
+    mov     rax, [rsp + 16648]
 
     mov     rdi, 0x7FFFFFFFFFFFFFFF
     cmp     rax, rdi
@@ -469,6 +495,16 @@ search_core:
     mov     rdi, rax
     sar     rdi, CID_BITS                  ; best_lb (non-negative; arithmetic shift OK)
     shl     rdi, IDX_BITS
+
+    ; Adaptive tail cut: once we've already paid for >10 probes, inflate the
+    ; lower bound by +50% so the prune below fires more eagerly.  Trades a
+    ; bit of accuracy on slow queries for a big p99 win.
+    cmp     r15d, 10
+    jle     .check_term
+    mov     rcx, rdi
+    shr     rcx, 1                         ; rcx = best_lb / 2
+    add     rdi, rcx                       ; rdi = best_lb * 3/2
+.check_term:
     cmp     rdi, r14
     jge     .done
 
@@ -480,6 +516,7 @@ search_core:
     mov     [rcx + rdi*8], rdx
 
     ; scan_cluster(ix, best_c, qpair, topk_k, topk_l, &worst_key)
+    TRACE_TSC qword [rsp + 16640]
     mov     [rsp + SS_WORST_KEY], r14
     mov     esi, edi                       ; best_c -> arg2
     mov     rdi, rbx                       ; ix    -> arg1
@@ -488,6 +525,8 @@ search_core:
     mov     r8, r13                        ; topk_l -> arg5
     lea     r9, [rsp + SS_WORST_KEY]       ; &worst_key -> arg6
     call    scan_cluster
+    TRACE_PHASE_SUM g_search_scan_sum, qword [rsp + 16640]
+    inc     qword [rel g_search_scan_count]
     mov     r14, [rsp + SS_WORST_KEY]      ; reload updated worst_key
 
     inc     r15d
@@ -513,7 +552,8 @@ search:
     sub     rsp, 56                         ; topk_k(40)+topk_l(5)+pad — keeps rsp aligned
     ; layout: [rsp + 0..39] topk_k, [rsp + 40..44] topk_l
 
-    mov     edx, [rdi + IX_N_CLUSTERS]      ; max_probes = full sweep
+    mov     edx, [rdi + IX_N_CLUSTERS]      ; max_probes = full sweep; adaptive
+                                            ; epsilon in search_core caps work
     xor     ecx, ecx                        ; trace = NULL
     lea     r8, [rsp]
     lea     r9, [rsp + 40]

@@ -16,14 +16,20 @@ default rel
 %include "syscalls.inc"
 %include "macros.inc"
 %include "uring.inc"
+%include "trace.inc"
 
 extern parse_request
+
+; Search sub-phase counters (defined in search.asm).
+extern g_search_cp_sum, g_search_pick_sum, g_search_pick_count
+extern g_search_scan_sum, g_search_scan_count
 extern vectorize
 extern search
 extern mcc_init
 extern index_open
 extern uring_init
 extern uring_submit_and_wait
+extern uring_submit_no_wait
 extern uring_register_files
 extern uring_register_pbuf_ring
 
@@ -108,6 +114,12 @@ err_index_msg_len equ $ - err_index_msg
 err_bind_msg:       db "error: bind_control_uds failed", 10
 err_bind_msg_len  equ $ - err_bind_msg
 dbg_hex:        db "0123456789ABCDEF"
+
+; Trace dump markers (8-byte each so binary scanners can grep them).
+align 8
+trace_srv_magic:    db "TRC_SRV1"
+trace_srv_end:      db "END_SRV", 10
+trace_srv_path:     db "/traces/dump.bin", 0
 
 ; Static HTTP/POST + canonical JSON body used by warm_handle_request to
 ; pre-run the full parse + vectorize + search + format pipeline at startup.
@@ -194,6 +206,37 @@ recvmsg_iobuf:    resb 16
 recvmsg_iov:      resb 16
 recvmsg_cmsg:     resb 256
 recvmsg_hdr:      resb 56
+
+; 4K-aliasing guard: forbid the recvmsg control plane and the per-request
+; instrumentation counters from landing at the same page offset.  Bits 0-11
+; of two recent load/store addresses match → Haswell predicts a false
+; dependency and emits a machine-clear (~15-25 cycles).  128 B is enough to
+; bump the next block past the aliasing window.
+alignb 64
+g_alias_pad_a:    resb 128
+
+; ---------------------------------------------------------------------------
+; Instrumentation state.  Lives in .bss so it's zero-initialised.  All fields
+; are accessed single-threaded from handle_request / server_loop_uring; no
+; atomics needed.
+; ---------------------------------------------------------------------------
+alignb 64
+g_srv_req_count:    resq 1               ; POST requests completed
+g_srv_enter_count:  resq 1               ; io_uring_enter calls
+g_srv_parse_sum:    resq 1               ; sum of parse_request cycles
+g_srv_vec_sum:      resq 1               ; sum of vectorize cycles
+g_srv_search_sum:   resq 1               ; sum of search cycles
+g_srv_handle_sum:   resq 1               ; sum of total handle_request cycles
+g_srv_enter_sum:    resq 1               ; sum of cycles spent in submit_and_wait
+g_srv_pad_a:        resq 1               ; align cursor section
+g_srv_cursor:       resd 1               ; sample index
+g_srv_pad0:         resd 1
+
+alignb 64
+g_srv_parse_ring:   resq TRACE_N
+g_srv_search_ring:  resq TRACE_N
+g_srv_handle_ring:  resq TRACE_N
+g_srv_enter_ring:   resq TRACE_N
 
 ; ===========================================================================
 section .text
@@ -448,6 +491,11 @@ handle_request:
     mov     r12, r8
     movsxd  r13, edx                     ; body_off
 
+    ; Instrumentation slots in scratch zone:
+    ;   [rsp + 104] = req_start_tsc
+    ;   [rsp + 112] = phase_start_tsc
+    ; Saved here before any phase call so they survive callee clobbers.
+
     ; --- POST? (total >= 5 && buf[0..3] == "POST") ------------------------
     cmp     rbp, 5
     jl      .check_get
@@ -455,6 +503,13 @@ handle_request:
     jne     .check_get
 
     ; --- POST path ---------------------------------------------------------
+    ; Stash body_len in r13 high half before parse zeroes Request (need rcx
+    ; later but it survives all the SIMD/mov-imm below).  Take req_start TSC
+    ; right here so all phase deltas roll up cleanly.
+    mov     [rsp + 96], ecx              ; save body_len (scratch zone)
+    TRACE_TSC qword [rsp + 104]          ; req_start_tsc; clobbers rax/rdx/rcx
+    mov     ecx, [rsp + 96]              ; restore body_len
+
     ; Zero Request (72 B).
     pxor    xmm0, xmm0
     movdqu  [rsp + 0],  xmm0
@@ -464,24 +519,34 @@ handle_request:
     mov     qword [rsp + 64], 0          ; 8 bytes covers mcc+is_online..known_merchant (8 bytes)
 
     ; parse_request(buf + body_off, body_len, &req)
-    ; (rcx still holds body_len: only pxor/movdqu/mov-imm above, none clobber)
+    mov     [rsp + 96], ecx              ; spill body_len across TSC clobber
+    TRACE_TSC qword [rsp + 112]          ; phase_start = parse start
+    mov     ecx, [rsp + 96]
     lea     rdi, [rbx + r13]             ; buf + body_off
     movsxd  rsi, ecx                     ; body_len
     lea     rdx, [rsp + 0]               ; &req
     call    parse_request
+    mov     [rsp + 96], eax              ; spill parse return (need test below)
+    TRACE_PHASE_RING g_srv_parse_ring, g_srv_parse_sum, g_srv_cursor, qword [rsp + 112]
+    mov     eax, [rsp + 96]
     test    eax, eax
     jnz     .post_err                    ; parse_request != 0 → 400
 
     ; vectorize(&req, &q)
+    TRACE_TSC qword [rsp + 112]
     lea     rdi, [rsp + 0]
     lea     rsi, [rsp + 72]
     call    vectorize
+    TRACE_PHASE_SUM g_srv_vec_sum, qword [rsp + 112]
 
     ; fraud = search(&g_index, &q)
+    TRACE_TSC qword [rsp + 112]
     lea     rdi, [g_index]
     lea     rsi, [rsp + 72]
     call    search
-    movzx   eax, al                      ; fraud in low byte, zero-ext
+    mov     [rsp + 96], al               ; spill search return (1 byte fits)
+    TRACE_PHASE_RING g_srv_search_ring, g_srv_search_sum, g_srv_cursor, qword [rsp + 112]
+    movzx   eax, byte [rsp + 96]         ; fraud
     cmp     eax, 5
     jbe     .fraud_ok
     mov     eax, 5
@@ -492,6 +557,13 @@ handle_request:
     mov     [r12], ecx
     lea     rdx, [fraud_resp_ptr_table]
     mov     rax, [rdx + rax*8]
+    ; Record handle_request total + bump cursor (may fire dump on the last
+    ; sample).  Spill rax (response ptr) before TRACE clobbers it.
+    mov     [rsp + 96], rax
+    TRACE_PHASE_RING g_srv_handle_ring, g_srv_handle_sum, g_srv_cursor, qword [rsp + 104]
+    TRACE_COUNT g_srv_req_count
+    TRACE_BUMP g_srv_cursor, trace_dump_server, 4096
+    mov     rax, [rsp + 96]
     jmp     .ret
 
 .post_err:
@@ -531,6 +603,95 @@ handle_request:
     pop     r13
     pop     r12
     pop     rbp
+    pop     rbx
+    ret
+
+; ---- trace_dump_server ----------------------------------------------------
+; Single-shot dump of all instrumentation state to fd 1 (stdout).  Layout:
+;
+;   [8B]  magic "TRC_SRV1"
+;   [48B] 6 × u64 counters  (req, enter, parse_sum, vec_sum, search_sum, handle_sum)
+;   [8B]  u32 cursor + u32 pad
+;   [32K] g_srv_parse_ring   (TRACE_N × u64)
+;   [32K] g_srv_search_ring  (TRACE_N × u64)
+;   [32K] g_srv_handle_ring  (TRACE_N × u64)
+;   [8B]  end marker "END_SRV\n"
+;
+; Total ~98 KB.  Called once by TRACE_BUMP when cursor hits TRACE_DONE_AT.
+
+trace_dump_server:
+    push    rbx                          ; saved file fd
+    sub     rsp, 8                       ; align
+
+    ; open("/traces/dump.bin", O_WRONLY|O_CREAT|O_TRUNC, 0644)
+    lea     rdi, [rel trace_srv_path]
+    mov     esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov     edx, 0o644
+    syscall0 SYS_open
+    test    rax, rax
+    js      .done                         ; open failed — bind-mount missing
+    mov     ebx, eax
+
+    mov     edi, ebx
+    lea     rsi, [rel trace_srv_magic]
+    mov     edx, 8
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel g_srv_req_count]
+    mov     edx, 64                       ; 8 × u64 counters (incl. enter_sum + pad)
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel g_srv_cursor]
+    mov     edx, 8
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel g_srv_parse_ring]
+    mov     edx, TRACE_N * 8
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel g_srv_search_ring]
+    mov     edx, TRACE_N * 8
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel g_srv_handle_ring]
+    mov     edx, TRACE_N * 8
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel g_srv_enter_ring]
+    mov     edx, TRACE_N * 8
+    mov     eax, SYS_write
+    syscall
+
+    ; Search sub-phase counters (5 × u64, contiguous in search.asm bss).
+    mov     edi, ebx
+    lea     rsi, [rel g_search_cp_sum]
+    mov     edx, 40
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    lea     rsi, [rel trace_srv_end]
+    mov     edx, 8
+    mov     eax, SYS_write
+    syscall
+
+    mov     edi, ebx
+    syscall0 SYS_close
+
+.done:
+    add     rsp, 8
     pop     rbx
     ret
 
@@ -1862,9 +2023,12 @@ server_loop_uring:
     mov     [r15], ebp                    ; publish new cq head
 
 .submit_wait:
+    TRACE_COUNT g_srv_enter_count
+    TRACE_TSC qword [rsp + 0]            ; pre-enter TSC into scratch slot
     lea     rdi, [g_ring]
     mov     esi, 1
     call    uring_submit_and_wait
+    TRACE_PHASE_RING g_srv_enter_ring, g_srv_enter_sum, g_srv_cursor, qword [rsp + 0]
     ; -EINTR / transient: keep looping.  Any positive return is the count of
     ; SQEs the kernel ingested; ignored.
     jmp     .outer
@@ -2096,6 +2260,26 @@ _start:
     call    warm_dummy_syscalls
     call    warm_index
     call    warm_handle_request
+
+    ; Reset instrumentation state.  warm_index bypasses handle_request and
+    ; bumps the search sub-phase counters with cold-cache synthetic queries
+    ; (10x more expensive than real traffic), while warm_handle_request adds
+    ; another 1000 iterations into the same counters.  Wipe everything so
+    ; the dump only reflects real client traffic.
+    xor     eax, eax
+    mov     [rel g_srv_req_count], rax
+    mov     [rel g_srv_enter_count], rax
+    mov     [rel g_srv_parse_sum], rax
+    mov     [rel g_srv_vec_sum], rax
+    mov     [rel g_srv_search_sum], rax
+    mov     [rel g_srv_handle_sum], rax
+    mov     [rel g_srv_enter_sum], rax
+    mov     dword [rel g_srv_cursor], 0
+    mov     [rel g_search_cp_sum], rax
+    mov     [rel g_search_pick_sum], rax
+    mov     [rel g_search_pick_count], rax
+    mov     [rel g_search_scan_sum], rax
+    mov     [rel g_search_scan_count], rax
 
     mov     rdi, r14
     call    bind_control_uds

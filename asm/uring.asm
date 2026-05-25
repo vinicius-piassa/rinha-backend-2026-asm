@@ -51,11 +51,35 @@ uring_init:
     vmovdqu [rsp + 112], xmm0
 
     ; ring_fd = io_uring_setup(entries, &params)
+    ; Graceful fallback ladder: light up low-latency flags on modern kernels
+    ; but still boot on older ones.
+    ;   1) SINGLE_ISSUER | DEFER_TASKRUN | SUBMIT_ALL  (Linux 6.0+)
+    ;   2) COOP_TASKRUN | SUBMIT_ALL                   (Linux 5.19+)
+    ;   3) 0                                           (always works)
+    mov     dword [rsp + PARAMS_FLAGS], \
+            IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SUBMIT_ALL
+    mov     edi, r12d
+    lea     rsi, [rsp + 0]
+    syscall0 SYS_io_uring_setup
+    test    rax, rax
+    jns     .setup_ok
+
+    mov     dword [rsp + PARAMS_FLAGS], \
+            IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SUBMIT_ALL
+    mov     edi, r12d
+    lea     rsi, [rsp + 0]
+    syscall0 SYS_io_uring_setup
+    test    rax, rax
+    jns     .setup_ok
+
+    mov     dword [rsp + PARAMS_FLAGS], 0
     mov     edi, r12d
     lea     rsi, [rsp + 0]
     syscall0 SYS_io_uring_setup
     test    rax, rax
     js      .fail
+
+.setup_ok:
     mov     r13d, eax
     mov     [rbx + URING_FD], r13d
 
@@ -151,6 +175,30 @@ uring_init:
 
     mov     dword [rbx + URING_SQ_TAIL_CACHED], 0
 
+    ; Register the ring fd with itself so subsequent io_uring_enter calls can
+    ; pass IORING_ENTER_REGISTERED_RING and a small index instead of the real
+    ; fd — saves the kernel a per-call fdget/fdput.  Reuses the params slab
+    ; (no longer needed) as scratch for struct io_uring_rsrc_update.
+    ; On any error, fall back to using the real fd by leaving REG_FD = -1.
+    mov     dword [rsp + RSRC_UPDATE_OFFSET], -1   ; let kernel assign slot
+    mov     dword [rsp + RSRC_UPDATE_RESV], 0
+    mov     dword [rsp + RSRC_UPDATE_DATA], r13d
+    mov     dword [rsp + RSRC_UPDATE_DATA + 4], 0
+
+    mov     edi, r13d
+    mov     esi, IORING_REGISTER_RING_FDS
+    lea     rdx, [rsp + 0]
+    mov     r10d, 1
+    syscall0 SYS_io_uring_register
+    cmp     rax, 1
+    jne     .reg_fd_fail
+    mov     eax, [rsp + RSRC_UPDATE_OFFSET]
+    mov     [rbx + URING_REG_FD], eax
+    jmp     .reg_fd_done
+.reg_fd_fail:
+    mov     dword [rbx + URING_REG_FD], -1
+.reg_fd_done:
+
     xor     eax, eax
     add     rsp, 128
     pop     r13
@@ -206,17 +254,79 @@ uring_submit_and_wait:
     mov     ecx, edx
     sub     ecx, eax                     ; submit count
 
-    ; io_uring_enter(fd, to_submit, min_complete, GETEVENTS, NULL, 0)
-    mov     edi, [rbx + URING_FD]
+    ; Pick arg1 (ring identifier) + enter flags: prefer the registered ring
+    ; index when uring_init managed to install one, falling back to the real
+    ; ring fd otherwise.  Computed before the syscall arg moves so edx (which
+    ; gets overwritten with min_complete below) is free to scratch.
+    mov     eax, [rbx + URING_REG_FD]
+    mov     edi, [rbx + URING_FD]            ; default: real ring fd
+    test    eax, eax
+    js      .use_real_fd
+    mov     edi, eax                          ; registered index
+    mov     r10d, IORING_ENTER_GETEVENTS | IORING_ENTER_REGISTERED_RING
+    jmp     .do_enter
+.use_real_fd:
+    mov     r10d, IORING_ENTER_GETEVENTS
+
+.do_enter:
+    ; io_uring_enter(ring_or_idx, to_submit, min_complete, flags, NULL, 0)
     mov     esi, ecx
     mov     edx, r12d
-    mov     r10d, IORING_ENTER_GETEVENTS
     xor     r8, r8
     xor     r9, r9
     syscall0 SYS_io_uring_enter
 
     add     rsp, 8
     pop     r12
+    pop     rbx
+    ret
+
+; ---- uring_submit_no_wait -------------------------------------------------
+; void uring_submit_no_wait(Ring *ring);
+;   rdi = ring
+;
+; Publishes the cached SQ tail and calls io_uring_enter WITHOUT GETEVENTS
+; (min_complete = 0).  Kicks the kernel into processing queued SQEs while
+; userspace continues to busy-poll for completions.  Never blocks.
+
+global uring_submit_no_wait
+uring_submit_no_wait:
+    push    rbx
+    sub     rsp, 8
+
+    mov     rbx, rdi
+
+    ; Publish cached tail (plain store; syscall provides the barrier).
+    mov     rcx, [rbx + URING_SQ_TAIL]
+    mov     edx, [rbx + URING_SQ_TAIL_CACHED]
+    mov     [rcx], edx
+
+    ; submit_count = cached_tail - kernel_head
+    mov     rcx, [rbx + URING_SQ_HEAD]
+    mov     eax, [rcx]
+    mov     ecx, edx
+    sub     ecx, eax
+    jz      .done                        ; nothing to submit — skip the syscall
+
+    ; Pick fd / flag using the same registered-ring trick as submit_and_wait.
+    mov     eax, [rbx + URING_REG_FD]
+    mov     edi, [rbx + URING_FD]
+    test    eax, eax
+    js      .use_real_fd
+    mov     edi, eax
+    mov     r10d, IORING_ENTER_REGISTERED_RING
+    jmp     .do_enter
+.use_real_fd:
+    xor     r10d, r10d                   ; no flags = non-blocking submit
+.do_enter:
+    mov     esi, ecx                     ; submit_count
+    xor     edx, edx                     ; min_complete = 0
+    xor     r8, r8
+    xor     r9, r9
+    syscall0 SYS_io_uring_enter
+
+.done:
+    add     rsp, 8
     pop     rbx
     ret
 
