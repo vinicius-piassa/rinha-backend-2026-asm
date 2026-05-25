@@ -386,4 +386,39 @@ uring_register_files:
     pop     rbx
     ret
 
+; ---- uring_register_napi --------------------------------------------------
+; void uring_register_napi(Ring *ring, u32 busy_poll_us);
+;
+; Tells the kernel to busy-poll the socket's NAPI handler for `busy_poll_us`
+; microseconds inside io_uring_enter before sleeping.  Cuts the NIC→user
+; wake-up latency at the cost of a bit of kernel CPU.  Best-effort: kernels
+; older than 6.9 return -EINVAL and we silently ignore.
+
+global uring_register_napi
+uring_register_napi:
+    push    rbx
+    sub     rsp, 24                       ; struct io_uring_napi (20 B) + align
+
+    mov     rbx, rdi
+
+    ; Zero all 24 bytes (covers the 20-byte struct + slack).  Kernel ≥6.9
+    ; checks resv[3] is fully zero; even one uninitialised byte → -EINVAL.
+    xor     eax, eax
+    mov     [rsp + 0],  rax
+    mov     [rsp + 8],  rax
+    mov     [rsp + 16], rax
+    mov     [rsp + NAPI_BUSY_POLL_TO], esi
+    mov     byte [rsp + NAPI_PREFER_BUSY_POLL], 1
+
+    mov     edi, [rbx + URING_FD]
+    mov     esi, IORING_REGISTER_NAPI
+    lea     rdx, [rsp + 0]
+    mov     r10d, 1
+    syscall0 SYS_io_uring_register
+    ; Ignore return value — best-effort on kernels that don't support it.
+
+    add     rsp, 24
+    pop     rbx
+    ret
+
 section .note.GNU-stack noalloc noexec nowrite progbits

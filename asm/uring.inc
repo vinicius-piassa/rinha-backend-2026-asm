@@ -155,6 +155,22 @@
 %define IORING_UNREGISTER_PBUF_RING 23
 %define IORING_REGISTER_RING_FDS   20   ; register ring fd for fast enter
 %define IORING_UNREGISTER_RING_FDS 21
+%define IORING_REGISTER_NAPI       27   ; kernel busy-poll NAPI hint (6.9+)
+%define IORING_UNREGISTER_NAPI     28
+
+; struct io_uring_napi — 20 B (NOT 16; the kernel uses resv[3] as three u32
+; words, not a single u64).  On kernels ≥ 6.9 the kernel copies 20 B from
+; userspace and rejects any non-zero byte in resv with -EINVAL, so the
+; underflowed 16-B version silently dropped the NAPI hint.
+;   busy_poll_to        — u32 microsecond NAPI poll timeout during enter
+;   prefer_busy_poll    — u8, set to 1 to enable
+;   pad[3]              — u8 explicit padding (zero)
+;   resv[3]             — u32 reserved (zero)
+%define NAPI_BUSY_POLL_TO          0    ; u32
+%define NAPI_PREFER_BUSY_POLL      4    ; u8
+%define NAPI_PAD                   5    ; u8[3]
+%define NAPI_RESV                  8    ; u32[3]
+%define NAPI_SIZE                  20
 
 ; struct io_uring_rsrc_update — 16 bytes; used for IORING_REGISTER_RING_FDS.
 ; { u32 offset; u32 resv; u64 data; }  Caller writes offset=-1U to ask the

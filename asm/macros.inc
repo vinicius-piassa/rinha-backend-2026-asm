@@ -51,7 +51,7 @@
 ; --- project constants -----------------------------------------------------
 
 %define N_DIMS        14
-%define N_CLUSTERS    2048
+%define N_CLUSTERS    4096
 %define K_NEIGHBORS   5
 %define SCALE         10000
 %define N_PAIRS       7

@@ -66,6 +66,8 @@
 %define SYS_sched_setparam    142
 %define SYS_sched_getparam    143
 %define SYS_sched_setscheduler 144
+%define SYS_sched_setaffinity 203
+%define SYS_sched_getaffinity 204
 %define SYS_clock_gettime     228
 %define SYS_clock_nanosleep   230
 %define SYS_exit_group        231

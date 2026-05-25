@@ -25,11 +25,11 @@ default rel
 %include "syscalls.inc"
 %include "macros.inc"
 %include "uring.inc"
-%include "trace.inc"
 
 extern uring_init
 extern uring_submit_and_wait
 extern uring_register_files
+extern uring_register_napi
 
 %define MAX_BACKENDS    8
 %define MAX_EVENTS      64
@@ -46,12 +46,6 @@ err_listen_msg: db "lb: listen_tcp failed", 10
 err_listen_msg_len equ $ - err_listen_msg
 err_backend_msg: db "lb: backend connect failed (gave up)", 10
 err_backend_msg_len equ $ - err_backend_msg
-
-; Trace dump markers (8 bytes each).
-align 8
-trace_lb_magic:  db "TRC_LB__"
-trace_lb_end:    db "END_LB_", 10
-trace_lb_path:   db "/traces/dump.bin", 0
 
 ; Static HTTP/POST + canonical JSON used by the forked self-warm child to
 ; round-trip real packets through the LB → SCM_RIGHTS → API → response
@@ -114,21 +108,6 @@ reg_files:      resd (MAX_BACKENDS + 1)
 alignb 64
 msgpool:        resb MSGPOOL_BYTES
 msgpool_cursor: resd 1
-
-; ---------------------------------------------------------------------------
-; Instrumentation state.  Same scheme as server.asm — single-shot dump to
-; stdout after TRACE_DONE_AT accepts complete.
-; ---------------------------------------------------------------------------
-alignb 64
-g_lb_accept_count:  resq 1               ; accept CQEs handled successfully
-g_lb_enter_count:   resq 1               ; io_uring_enter calls
-g_lb_handle_sum:    resq 1               ; sum of handle_accept_cqe cycles
-g_lb_pad0:          resq 1               ; padding to keep next field 64-aligned
-g_lb_cursor:        resd 1
-g_lb_pad1:          resd 1
-
-alignb 64
-g_lb_handle_ring:   resq TRACE_N
 
 ; ===========================================================================
 section .text
@@ -605,9 +584,6 @@ handle_accept_cqe:
     mov     ebx, edi
     mov     ebp, r8d
 
-    ; Stash entry TSC in scratch [rsp + 8] (won't conflict with optval at [rsp+0]).
-    TRACE_TSC qword [rsp + 8]
-
     test    ebx, ebx
     js      .recheck_more                ; negative result → some error
 
@@ -627,20 +603,12 @@ handle_accept_cqe:
     mov     r8d, 4
     syscall0 SYS_setsockopt
 
-    ; --- SO_BUSY_POLL = 50µs (best effort)
-    ; Kernel busy-polls the socket for up to 50µs before sleeping, cutting
-    ; wake-up latency when packets arrive shortly after recv enters the queue.
-    ; The fd is shared via SCM_RIGHTS, so this property propagates to the API.
-    ; Kernel rejects with -EPERM if val > sysctl_net_busy_poll and we lack
-    ; CAP_NET_ADMIN; we ignore the return code so old/locked-down hosts still
-    ; boot cleanly.
-    mov     dword [rsp + 0], 50
-    mov     edi, ebx
-    mov     esi, SOL_SOCKET
-    mov     edx, SO_BUSY_POLL
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
+    ; SO_BUSY_POLL on this fd was a no-op: LB never recv()s the accepted
+    ; client socket — it sends it via SCM_RIGHTS and closes its copy.  The
+    ; busy-poll property does NOT propagate through fd-passing in a way that
+    ; benefits the receiver, so the option was 600 ns of dead syscall per
+    ; accept.  The API gets busy-poll via IORING_REGISTER_NAPI on its uring
+    ; instead, which is the kernel-supported path.
 
     ; --- pick a msgpool entry: idx = msgpool_cursor++ & MASK
     mov     eax, [msgpool_cursor]
@@ -694,15 +662,6 @@ handle_accept_cqe:
     mov     [rax + SQE_USER_DATA], rdx
 
 .recheck_more:
-    ; Record stats only for successful accepts (ebx >= 0).  Errors and
-    ; SQ-full retries skip so they don't pollute the histogram.
-    test    ebx, ebx
-    js      .skip_record
-    TRACE_PHASE_RING g_lb_handle_ring, g_lb_handle_sum, g_lb_cursor, qword [rsp + 8]
-    TRACE_COUNT g_lb_accept_count
-    TRACE_BUMP g_lb_cursor, trace_dump_lb, 256
-.skip_record:
-
     ; Multishot accept: kernel keeps the SQE armed and clears CQE_F_MORE only
     ; when it stops (e.g., on cancellation or fatal listen-fd error).  Re-arm
     ; only in that case; the steady state pays zero submission cost.
@@ -722,66 +681,6 @@ handle_accept_cqe:
     mov     edi, ebx
     syscall0 SYS_close
     jmp     .recheck_more
-
-; ---- trace_dump_lb --------------------------------------------------------
-; Single-shot dump of LB instrumentation state to stdout.  Layout:
-;   [8B]   "TRC_LB__"
-;   [24B]  3 × u64 counters (accept, enter, handle_sum)
-;   [8B]   pad
-;   [8B]   u32 cursor + u32 pad
-;   [32K]  g_lb_handle_ring
-;   [8B]   "END_LB_\n"
-
-trace_dump_lb:
-    push    rbx
-    sub     rsp, 8
-
-    ; open("/traces/dump.bin", O_WRONLY|O_CREAT|O_TRUNC, 0644)
-    lea     rdi, [rel trace_lb_path]
-    mov     esi, O_WRONLY | O_CREAT | O_TRUNC
-    mov     edx, 0o644
-    syscall0 SYS_open
-    test    rax, rax
-    js      .done
-    mov     ebx, eax
-
-    mov     edi, ebx
-    lea     rsi, [rel trace_lb_magic]
-    mov     edx, 8
-    mov     eax, SYS_write
-    syscall
-
-    mov     edi, ebx
-    lea     rsi, [rel g_lb_accept_count]
-    mov     edx, 32
-    mov     eax, SYS_write
-    syscall
-
-    mov     edi, ebx
-    lea     rsi, [rel g_lb_cursor]
-    mov     edx, 8
-    mov     eax, SYS_write
-    syscall
-
-    mov     edi, ebx
-    lea     rsi, [rel g_lb_handle_ring]
-    mov     edx, TRACE_N * 8
-    mov     eax, SYS_write
-    syscall
-
-    mov     edi, ebx
-    lea     rsi, [rel trace_lb_end]
-    mov     edx, 8
-    mov     eax, SYS_write
-    syscall
-
-    mov     edi, ebx
-    syscall0 SYS_close
-
-.done:
-    add     rsp, 8
-    pop     rbx
-    ret
 
 ; ---- lb_loop_uring -------------------------------------------------------
 ; Single-thread event loop.  Drains all visible CQEs, then submits +
@@ -845,7 +744,6 @@ lb_loop_uring:
     mov     [r14], ebx
 
 .submit_wait:
-    TRACE_COUNT g_lb_enter_count
     lea     rdi, [g_ring]
     mov     esi, 1
     call    uring_submit_and_wait
@@ -1062,8 +960,13 @@ _start:
 
     ; io_uring path (multishot accept + registered files + linked
     ; sendmsg→close).
+    ; SQ size 1024: each accept consumes 2 SQEs (sendmsg + close) plus the
+    ; multishot accept itself.  Bursts of ~100 concurrent accepts can pile
+    ; up enough in-flight ops to overflow a 256-slot ring, falling back to
+    ; the synchronous-close path (lb.asm:.skip_close) which shows up as p99
+    ; spikes.  1024 gives 4× headroom; SQ memory cost is trivial (~24 KB).
     lea     rdi, [g_ring]
-    mov     esi, 256
+    mov     esi, 1024
     call    uring_init
     test    eax, eax
     js      .fail_listen
@@ -1087,6 +990,11 @@ _start:
     call    uring_register_files
     test    eax, eax
     js      .fail_listen
+
+    ; Kernel busy-poll NAPI on the ring (50 µs budget).  Best-effort.
+    lea     rdi, [g_ring]
+    mov     esi, 50
+    call    uring_register_napi
 
     mov     edi, r13d
     call    spawn_self_warm

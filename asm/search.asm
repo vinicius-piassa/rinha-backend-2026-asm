@@ -2,7 +2,7 @@
 ;
 ; Implemented incrementally:
 ;   - compute_cluster_packed (phase 1): per-cluster bbox lower-bound, packed as
-;       (lb << CID_BITS) | cid into a 2048-entry i64 array.
+;       (lb << CID_BITS) | cid into an N_CLUSTERS-entry i64 array.
 ;   - pick_min_cluster       (phase 2): 4-wide AVX2 min over the packed array,
 ;       used to choose the next cluster to probe (smallest lb wins, cid breaks
 ;       ties).  Caller tombstones consumed clusters with INT64_MAX in place.
@@ -23,20 +23,6 @@ default rel
 
 %include "syscalls.inc"
 %include "macros.inc"
-%include "trace.inc"
-
-; ---- Sub-phase instrumentation (read by server.asm dump) ------------------
-; Defined here (instead of in server.asm) so the TRACE macros below address
-; them directly without needing extern.  Both are linked as ordinary globals.
-section .bss
-alignb 64
-global g_search_cp_sum, g_search_pick_sum, g_search_pick_count
-global g_search_scan_sum, g_search_scan_count
-g_search_cp_sum:        resq 1    ; sum of compute_cluster_packed cycles
-g_search_pick_sum:      resq 1    ; sum of pick_min_cluster cycles
-g_search_pick_count:    resq 1    ; total pick_min_cluster calls
-g_search_scan_sum:      resq 1    ; sum of scan_cluster cycles
-g_search_scan_count:    resq 1    ; total scan_cluster calls
 
 ; ---- IvfIndex struct layout ------------------------------------------------
 %define IX_FD                0    ; int      (+4 pad)
@@ -117,30 +103,42 @@ compute_cluster_packed:
 
 ; ---- pick_min_cluster -----------------------------------------------------
 ;   int64_t pick_min_cluster(const int64_t *packed, uint32_t n);
-;     rdi = packed array, esi = n  (must be multiple of 4)
+;     rdi = packed array, esi = n  (must be multiple of 8)
 ;     returns rax = min packed, or INT64_MAX if all entries are INT64_MAX
 ;
 ; Signed compare is correct because every packed value is non-negative
 ; (lb_max ~5.6e9 → 33 bits, |cid 12 bits = 45 bits) and INT64_MAX itself
 ; has bit 63 clear.
+;
+; Dual-chain: process 8 i64 lanes per iter via two independent min accums
+; (ymm0, ymm10).  Breaks the vpblendvb dep chain (port 5) that capped the
+; single-chain loop at ~2 cycles per 4 lanes.  Now ~2 cycles per 8 lanes.
 
 global pick_min_cluster
 pick_min_cluster:
     mov          rax, 0x7FFFFFFFFFFFFFFF
     vmovq        xmm0, rax
-    vpbroadcastq ymm0, xmm0                ; min_v = [INT64_MAX × 4]
+    vpbroadcastq ymm0, xmm0                ; chain A min = [INT64_MAX × 4]
+    vpbroadcastq ymm10, xmm0               ; chain B min = [INT64_MAX × 4]
 
     xor          ecx, ecx                  ; c = 0
 .loop:
     cmp          ecx, esi
     jae          .reduce
-    vmovdqu      ymm1, [rdi + rcx*8]
-    vpcmpgtq     ymm2, ymm0, ymm1          ; mask: min_v > v
-    vpblendvb    ymm0, ymm0, ymm1, ymm2    ; min_v := min(min_v, v) per lane
-    add          ecx, 4
+    vmovdqu      ymm1, [rdi + rcx*8]       ; lanes c..c+3
+    vmovdqu      ymm3, [rdi + rcx*8 + 32]  ; lanes c+4..c+7
+    vpcmpgtq     ymm2, ymm0, ymm1
+    vpcmpgtq     ymm4, ymm10, ymm3
+    vpblendvb    ymm0, ymm0, ymm1, ymm2
+    vpblendvb    ymm10, ymm10, ymm3, ymm4
+    add          ecx, 8
     jmp          .loop
 
 .reduce:
+    ; Fold chain B into chain A.
+    vpcmpgtq     ymm2, ymm0, ymm10
+    vpblendvb    ymm0, ymm0, ymm10, ymm2
+
     vextracti128 xmm1, ymm0, 1             ; xmm1 = lanes [2,3]
     vpcmpgtq     xmm2, xmm0, xmm1
     vpblendvb    xmm0, xmm0, xmm1, xmm2    ; xmm0 = [min(0,2), min(1,3)]
@@ -244,14 +242,17 @@ scan_cluster:
     cmp     rcx, rbp
     jae     .done
 
-    ; ----- prefetch 32 vectors ahead (4 batches) when far from cluster end -----
-    lea     rax, [rcx + 32]
+    ; ----- prefetch ~96 vectors (12 batches) ahead when far from cluster end.
+    ; At +128 B the prefetch landed only 4 batches ahead, which on a hot batch
+    ; (~10 cycles at 3 GHz) is ~12 ns — far short of DRAM latency (~80 ns).
+    ; +384 B = 96 vectors = ~12 batches, giving the line ~120 ns of head start.
+    lea     rax, [rcx + 96]
     cmp     rax, rbp
     jae     .skip_prefetch
 %assign P 0
 %rep N_PAIRS
     mov     rax, [rsp + P*8]
-    prefetcht0 [rax + rcx*4 + 128]
+    prefetcht0 [rax + rcx*4 + 384]
 %assign P P+1
 %endrep
 .skip_prefetch:
@@ -410,14 +411,15 @@ scan_cluster:
 ;     int64_t topk_k[5],     // r8
 ;     uint8_t topk_l[5]);    // r9
 
+; N_CLUSTERS × 8 B = 32768 B for the packed lower-bound array.  Previous
+; layout assumed k=2048 (16384 B); with k=4096 the array doubles, so QPAIR
+; and every later slot move up.
 %define SS_CLUSTER_PACKED   0
-%define SS_QPAIR            16384       ; 7 * 32 = 224 B, 32-aligned
-%define SS_WORST_KEY        16608
-%define SS_Q                16616
-%define SS_MAX_PROBES       16624
-%define SS_TSC              16640       ; instrumentation scratch (8 B)
-%define SS_RET_STASH        16648       ; pick_min return stash (8 B)
-%define FRAME_SIZE          16704       ; sub rsp, + slack for `and rsp, -32`
+%define SS_QPAIR            32768       ; 7 * 32 = 224 B, 32-aligned
+%define SS_WORST_KEY        32992
+%define SS_Q                33000
+%define SS_MAX_PROBES       33008
+%define FRAME_SIZE          33088       ; sub rsp, + 32 slack for `and rsp, -32`
 
 global search_core
 search_core:
@@ -461,16 +463,12 @@ search_core:
 %endrep
 
     ; Phase 1: compute_cluster_packed(q, bmin, bmax, n_clusters, out)
-    ; Bracket with rdtscp.  Scratch slot at [rsp + 16640] (within the unused
-    ; tail of FRAME_SIZE = 16704; SS_MAX_PROBES ends at 16628).
-    TRACE_TSC qword [rsp + 16640]
     mov     rdi, rsi
     mov     rsi, [rbx + IX_BBOX_MIN]
     mov     rdx, [rbx + IX_BBOX_MAX]
     mov     ecx, [rbx + IX_N_CLUSTERS]
     lea     r8, [rsp + SS_CLUSTER_PACKED]
     call    compute_cluster_packed
-    TRACE_PHASE_SUM g_search_cp_sum, qword [rsp + 16640]
 
     xor     r15d, r15d                     ; probe_count
 
@@ -478,14 +476,9 @@ search_core:
     cmp     r15d, [rsp + SS_MAX_PROBES]
     jge     .done
 
-    TRACE_TSC qword [rsp + 16640]
     lea     rdi, [rsp + SS_CLUSTER_PACKED]
     mov     esi, [rbx + IX_N_CLUSTERS]
     call    pick_min_cluster               ; rax = best_packed
-    mov     [rsp + 16648], rax             ; stash pick return across TRACE clobber
-    TRACE_PHASE_SUM g_search_pick_sum, qword [rsp + 16640]
-    inc     qword [rel g_search_pick_count]
-    mov     rax, [rsp + 16648]
 
     mov     rdi, 0x7FFFFFFFFFFFFFFF
     cmp     rax, rdi
@@ -516,7 +509,6 @@ search_core:
     mov     [rcx + rdi*8], rdx
 
     ; scan_cluster(ix, best_c, qpair, topk_k, topk_l, &worst_key)
-    TRACE_TSC qword [rsp + 16640]
     mov     [rsp + SS_WORST_KEY], r14
     mov     esi, edi                       ; best_c -> arg2
     mov     rdi, rbx                       ; ix    -> arg1
@@ -525,11 +517,31 @@ search_core:
     mov     r8, r13                        ; topk_l -> arg5
     lea     r9, [rsp + SS_WORST_KEY]       ; &worst_key -> arg6
     call    scan_cluster
-    TRACE_PHASE_SUM g_search_scan_sum, qword [rsp + 16640]
-    inc     qword [rel g_search_scan_count]
     mov     r14, [rsp + SS_WORST_KEY]      ; reload updated worst_key
 
     inc     r15d
+
+    ; Clear-cut early exit: after 4 probes, if top-5 labels are all-0 (all
+    ; legit) or all-1 (all fraud), the result is unambiguous — additional
+    ; probes can't change cnt, so we skip the rest.  Inspired by leader's
+    ; "repair pass" pattern but inverted: WE commit to the fast path by
+    ; default, only continue when ambiguous.
+    cmp     r15d, 4
+    jne     .probe
+    mov     rcx, 0x7FFFFFFFFFFFFFFF
+    cmp     r14, rcx
+    je      .probe                          ; top-5 not yet full; keep probing
+    ; Sum 5 label bytes via popcnt: each byte is 0 or 1, so the count of set
+    ; bits in the 5-byte block equals the fraud count.  Caller's topk_l[5]
+    ; lives in a 56-byte stack slot, so reading 8 bytes is safe.
+    mov     rax, [r13]                       ; 8 bytes (last 3 are garbage)
+    mov     rcx, 0xFFFFFFFFFF                ; mask to first 5 bytes
+    and     rax, rcx
+    popcnt  rax, rax                         ; rax ∈ [0,5]
+    test    eax, eax                        ; cnt == 0 → all legit
+    jz      .done
+    cmp     eax, 5                          ; cnt == 5 → all fraud
+    je      .done
     jmp     .probe
 
 .done:
@@ -559,17 +571,13 @@ search:
     lea     r9, [rsp + 40]
     call    search_core
 
-    xor     eax, eax
-    movzx   ecx, byte [rsp + 40]
-    add     eax, ecx
-    movzx   ecx, byte [rsp + 41]
-    add     eax, ecx
-    movzx   ecx, byte [rsp + 42]
-    add     eax, ecx
-    movzx   ecx, byte [rsp + 43]
-    add     eax, ecx
-    movzx   ecx, byte [rsp + 44]
-    add     eax, ecx
+    ; Sum 5 label bytes via popcnt — each byte is 0 or 1.  The 56-byte stack
+    ; allocation has 11 bytes of slack past topk_l, so reading 8 bytes from
+    ; [rsp+40] is safe.
+    mov     rax, [rsp + 40]                 ; 8 bytes (last 3 garbage)
+    mov     rcx, 0xFFFFFFFFFF               ; mask first 5 bytes
+    and     rax, rcx
+    popcnt  rax, rax                        ; rax ∈ [0,5]
 
     add     rsp, 56
     ret

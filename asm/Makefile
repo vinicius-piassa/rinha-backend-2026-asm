@@ -12,7 +12,7 @@
 NASM      ?= nasm
 LD        ?= ld
 
-NASMFLAGS  = -felf64 -g -F dwarf -Wall
+NASMFLAGS  = -felf64 -g -F dwarf -Wall -Wno-unknown-warning
 LDFLAGS    = -static -nostdlib --gc-sections
 
 BUILDDIR   = build
@@ -27,14 +27,12 @@ LIB_OBJS = $(BUILDDIR)/mcc.o $(BUILDDIR)/vectorize.o $(BUILDDIR)/search.o $(BUIL
 SERVER_BIN      = $(BUILDDIR)/asm_server
 LB_BIN          = $(BUILDDIR)/asm_lb
 BUILD_INDEX_BIN = $(BUILDDIR)/asm_build_index
-BENCH_BIN       = $(BUILDDIR)/bench
 
 # Shared includes — touching any of these rebuilds everything.
 INCS = syscalls.inc macros.inc uring.inc
 
-.PHONY: all clean test bench
+.PHONY: all clean test
 all: $(addprefix $(BUILDDIR)/,$(BINS)) $(LIB_OBJS) $(SERVER_BIN) $(LB_BIN) $(BUILD_INDEX_BIN)
-bench: $(BENCH_BIN)
 
 $(BUILDDIR):
 	mkdir -p $@
@@ -58,9 +56,6 @@ $(LB_BIN): $(BUILDDIR)/lb.o $(BUILDDIR)/uring.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(BUILD_INDEX_BIN): $(BUILDDIR)/build_index.o $(BUILDDIR)/parse.o
-	$(LD) $(LDFLAGS) -o $@ $^
-
-$(BENCH_BIN): $(BUILDDIR)/bench.o $(BUILDDIR)/parse.o $(BUILDDIR)/vectorize.o $(BUILDDIR)/search.o $(BUILDDIR)/mcc.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 test: $(BUILDDIR)/hello $(BUILDDIR)/test_mcc $(BUILDDIR)/test_vectorize

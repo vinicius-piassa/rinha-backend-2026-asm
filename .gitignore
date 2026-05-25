@@ -2,5 +2,7 @@ asm/build/
 *.o
 *.bin
 !/index.bin
+*.backup
 *.swp
 .DS_Store
+.claude/
