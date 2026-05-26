@@ -120,11 +120,11 @@ align 8
 c_legit_max_amount:  dq 500.0
 c_legit_max_ratio:   dq 0.5
 c_legit_max_km:      dq 50.0
-; fraud min_amount lowered 5000→3000: sweep against the entire test-data
-; corpus confirms 0 FP / FN at any value ≥ 3000.  Below 3000 starts
-; producing FPs (13 at 2500 → -780 penalty).  Fast-path coverage 79.40%
-; → 90.05% (+10.65%, no detection loss).
-c_fraud_min_amount:  dq 3000.0
+; fraud min_amount kept at 5000: relaxing to 3000 looked 0-error on
+; test-data.json but produced 28 FPs (-438 penalty) on the official bench,
+; which uses different payloads.  Tuning thresholds to the local test
+; corpus over-fits.  5000 is the conservative-safe value.
+c_fraud_min_amount:  dq 5000.0
 c_fraud_min_km:      dq 150.0
 c_one_d_fp:          dq 1.0
 
