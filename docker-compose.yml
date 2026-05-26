@@ -1,5 +1,5 @@
 x-asm: &asm
-  image: ghcr.io/vinicius-piassa/rinha-backend-2026-asm:1509acd
+  image: ghcr.io/vinicius-piassa/rinha-backend-2026-asm:59ff5ec
   platform: linux/amd64
   restart: unless-stopped
   networks:
