@@ -51,8 +51,14 @@
 ; --- project constants -----------------------------------------------------
 
 %define N_DIMS        14
-%define N_CLUSTERS    4096
+%define N_CLUSTERS    2048
 %define K_NEIGHBORS   5
+; Initial probe budget; if top-5 label count falls in [NPROBE_REPAIR_MIN,
+; NPROBE_REPAIR_MAX] (ambiguous), the probe loop extends to N_CLUSTERS so
+; the lb-prune can run a full sweep.  The repair phase continues across the full sweep.
+%define NPROBE_INITIAL     12
+%define NPROBE_REPAIR_MIN  1
+%define NPROBE_REPAIR_MAX  4
 %define SCALE         10000
 %define N_PAIRS       7
 %define BBOX_LANES    16

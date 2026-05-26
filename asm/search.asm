@@ -411,15 +411,16 @@ scan_cluster:
 ;     int64_t topk_k[5],     // r8
 ;     uint8_t topk_l[5]);    // r9
 
-; N_CLUSTERS × 8 B = 32768 B for the packed lower-bound array.  Previous
-; layout assumed k=2048 (16384 B); with k=4096 the array doubles, so QPAIR
-; and every later slot move up.
+; Layout parametrised on N_CLUSTERS.  Packed lb array = K × 8 B; the qpair
+; block must be 32-aligned (it's the destination of vmovdqa stores).  With
+; K=2048 → 16 384 B; K=4096 → 32 768 B; the rest moves accordingly.
 %define SS_CLUSTER_PACKED   0
-%define SS_QPAIR            32768       ; 7 * 32 = 224 B, 32-aligned
-%define SS_WORST_KEY        32992
-%define SS_Q                33000
-%define SS_MAX_PROBES       33008
-%define FRAME_SIZE          33088       ; sub rsp, + 32 slack for `and rsp, -32`
+%define SS_QPAIR            (N_CLUSTERS * 8)            ; 7 × 32 = 224 B, 32-aligned
+%define SS_WORST_KEY        (SS_QPAIR + 224)
+%define SS_Q                (SS_WORST_KEY + 8)
+%define SS_MAX_PROBES       (SS_Q + 8)
+%define SS_REPAIR_DONE      (SS_MAX_PROBES + 8)         ; u8 flag (8 B for align)
+%define FRAME_SIZE          (SS_REPAIR_DONE + 8 + 32)   ; +32 slack for `and rsp, -32`
 
 global search_core
 search_core:
@@ -440,6 +441,7 @@ search_core:
 
     mov     [rsp + SS_Q], rsi
     mov     [rsp + SS_MAX_PROBES], edx
+    mov     qword [rsp + SS_REPAIR_DONE], 0
 
     ; topk_k[0..4] = INT64_MAX, topk_l[0..4] = 0, worst_key = INT64_MAX
     mov     rax, 0x7FFFFFFFFFFFFFFF
@@ -514,13 +516,43 @@ search_core:
 
     inc     r15d
     jmp     .probe
-    ; Clear-cut early exit removed: it triggered when the current top-5 was
-    ; all-0 or all-5 labels, but a later cluster CAN contain a closer vector
-    ; with the opposite label, kicking a current entry out and flipping cnt.
-    ; On the official bench this produced 1 FP → −90 absolute penalty,
-    ; wiping the p99 savings from the early exit.
 
 .done:
+    ; ---- Repair pattern --------------------------------------
+    ; The initial probe budget is small (NPROBE_INITIAL = 12).  When that
+    ; finishes, the top-5 label sum is either unambiguous (0 = all legit,
+    ; 5 = all fraud) or ambiguous ([1, 4]).  Unambiguous → return; the
+    ; HTTP fraud_score for that bucket is decided by cnt alone, so further
+    ; probing can only ratify it.  Ambiguous → extend the probe budget to
+    ; the full cluster count and continue (lb-prune will still cut it short
+    ; in practice).
+    ;
+    ; r13 = topk_l base.  popcnt of the 5 label bytes = fraud count ∈ [0, 5]
+    ; (each byte is 0 or 1).
+    cmp     qword [rsp + SS_REPAIR_DONE], 0
+    jne     .really_done                   ; already extended; final exit
+    ; Need top-K populated; if worst_key is still INT64_MAX (fewer than 5
+    ; vectors scanned), we don't have enough to judge — fall through to
+    ; the extend path so we keep probing.
+    mov     rcx, 0x7FFFFFFFFFFFFFFF
+    cmp     r14, rcx
+    je      .repair_extend
+    mov     rax, [r13]
+    mov     rcx, 0xFFFFFFFFFF
+    and     rax, rcx
+    popcnt  rax, rax                       ; rax = fraud count ∈ [0,5]
+    cmp     eax, NPROBE_REPAIR_MIN
+    jl      .really_done                   ; cnt == 0 → all legit, return
+    cmp     eax, NPROBE_REPAIR_MAX
+    jg      .really_done                   ; cnt == 5 → all fraud, return
+
+.repair_extend:
+    mov     qword [rsp + SS_REPAIR_DONE], 1
+    mov     eax, [rbx + IX_N_CLUSTERS]
+    mov     [rsp + SS_MAX_PROBES], eax     ; extend to full sweep
+    jmp     .probe
+
+.really_done:
     mov     rsp, rbp
     pop     r15
     pop     r14
@@ -540,8 +572,9 @@ search:
     sub     rsp, 56                         ; topk_k(40)+topk_l(5)+pad — keeps rsp aligned
     ; layout: [rsp + 0..39] topk_k, [rsp + 40..44] topk_l
 
-    mov     edx, [rdi + IX_N_CLUSTERS]      ; max_probes = full sweep; adaptive
-                                            ; epsilon in search_core caps work
+    mov     edx, NPROBE_INITIAL             ; initial probe budget; search_core
+                                            ; extends to N_CLUSTERS only if
+                                            ; the resulting top-5 is ambiguous
     xor     ecx, ecx                        ; trace = NULL
     lea     r8, [rsp]
     lea     r9, [rsp + 40]
