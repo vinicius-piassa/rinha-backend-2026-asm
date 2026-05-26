@@ -56,7 +56,7 @@
 ; Initial probe budget; if top-5 label count falls in [NPROBE_REPAIR_MIN,
 ; NPROBE_REPAIR_MAX] (ambiguous), the probe loop extends to N_CLUSTERS so
 ; the lb-prune can run a full sweep.  The repair phase continues across the full sweep.
-%define NPROBE_INITIAL     12
+%define NPROBE_INITIAL     16
 %define NPROBE_REPAIR_MIN  1
 %define NPROBE_REPAIR_MAX  4
 %define SCALE         10000
