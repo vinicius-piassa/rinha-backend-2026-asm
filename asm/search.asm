@@ -513,29 +513,12 @@ search_core:
     mov     r14, [rsp + SS_WORST_KEY]      ; reload updated worst_key
 
     inc     r15d
-
-    ; Clear-cut early exit: after 4 probes, if top-5 labels are all-0 (all
-    ; legit) or all-1 (all fraud), the result is unambiguous — additional
-    ; probes can't change cnt, so we skip the rest.  Inspired by leader's
-    ; "repair pass" pattern but inverted: WE commit to the fast path by
-    ; default, only continue when ambiguous.
-    cmp     r15d, 4
-    jne     .probe
-    mov     rcx, 0x7FFFFFFFFFFFFFFF
-    cmp     r14, rcx
-    je      .probe                          ; top-5 not yet full; keep probing
-    ; Sum 5 label bytes via popcnt: each byte is 0 or 1, so the count of set
-    ; bits in the 5-byte block equals the fraud count.  Caller's topk_l[5]
-    ; lives in a 56-byte stack slot, so reading 8 bytes is safe.
-    mov     rax, [r13]                       ; 8 bytes (last 3 are garbage)
-    mov     rcx, 0xFFFFFFFFFF                ; mask to first 5 bytes
-    and     rax, rcx
-    popcnt  rax, rax                         ; rax ∈ [0,5]
-    test    eax, eax                        ; cnt == 0 → all legit
-    jz      .done
-    cmp     eax, 5                          ; cnt == 5 → all fraud
-    je      .done
     jmp     .probe
+    ; Clear-cut early exit removed: it triggered when the current top-5 was
+    ; all-0 or all-5 labels, but a later cluster CAN contain a closer vector
+    ; with the opposite label, kicking a current entry out and flipping cnt.
+    ; On the official bench this produced 1 FP → −90 absolute penalty,
+    ; wiping the p99 savings from the early exit.
 
 .done:
     mov     rsp, rbp
