@@ -65,11 +65,12 @@
 ; Initial probe budget; if top-5 label count falls in [NPROBE_REPAIR_MIN,
 ; NPROBE_REPAIR_MAX] (ambiguous), the probe loop extends to N_CLUSTERS so
 ; the lb-prune can run a full sweep.  The repair phase continues across the full sweep.
-; NPROBE lowered from 16 → 12: with 4-way partitioning, each sub-index has
-; tighter clusters (variance in dims 5/6/11 is constant within partition),
-; so fewer probes suffice for the same top-K accuracy.  Repair pattern
-; still extends to N_CLUSTERS when the result is ambiguous.
-%define NPROBE_INITIAL     12
+; NPROBE_INITIAL kept at 16: validated 0 mismatches at NPROBE=12 in Python
+; sim (2000 queries) but the official bench (#6788) regressed p99 by 30 µs
+; → -11pts.  Hypothesis: at NPROBE=12 the repair pattern triggers more
+; often (more ambiguous initial top-5), causing the full-sweep extension
+; to dominate cost.  16 is the sweet spot.
+%define NPROBE_INITIAL     16
 %define NPROBE_REPAIR_MIN  1
 %define NPROBE_REPAIR_MAX  4
 %define SCALE         10000
