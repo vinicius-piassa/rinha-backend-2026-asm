@@ -54,6 +54,23 @@ extern uring_register_pbuf_ring
 %define IX_BPSOA_MAX         128
 %define IX_SIZE              136
 
+; Request struct layout (must match parse.asm / vectorize.asm definitions).
+; Used by fast_path_classify below; vectorize.asm reads the same offsets.
+%define REQ_AMOUNT          0
+%define REQ_CUSTOMER_AVG    8
+%define REQ_MERCHANT_AVG    16
+%define REQ_KM_HOME         24
+%define REQ_KM_LAST         32
+%define REQ_TS              40
+%define REQ_LAST_TS         48
+%define REQ_INSTALLMENTS    56
+%define REQ_TX_COUNT_24H    60
+%define REQ_MCC             64
+%define REQ_IS_ONLINE       68
+%define REQ_CARD_PRESENT    69
+%define REQ_HAS_LAST_TX     70
+%define REQ_KNOWN_MERCHANT  71
+
 ; ===========================================================================
 section .rodata
 
@@ -97,6 +114,15 @@ fraud_resp_len_table:
 ready_resp:
     db "HTTP/1.1 200 OK", 13, 10, "Content-Length: 0", 13, 10, 13, 10
 ready_resp_len equ $ - ready_resp
+
+; Tier-1 fast-path thresholds (corpus-derived conservative cutoffs).
+align 8
+c_legit_max_amount:  dq 500.0
+c_legit_max_ratio:   dq 0.5
+c_legit_max_km:      dq 50.0
+c_fraud_min_amount:  dq 5000.0
+c_fraud_min_km:      dq 150.0
+c_one_d_fp:          dq 1.0
 
 err_resp:
     db "HTTP/1.1 400 Bad Request", 13, 10, "Content-Length: 0", 13, 10, 13, 10
@@ -153,6 +179,8 @@ epoll_fd:   resd 1
 ; Set to 1 after the first GET /ready completes its re-warm pass.  Keeps the
 ; handler fast on every subsequent /ready poll the engine might issue.
 ready_warm_done: resb 1
+; one-shot init flag for arm_ctrl_recvmsg (msg_iov/iovlen/control are static)
+ctrl_recvmsg_inited: resb 1
 
 ; io_uring state.  The Ring struct itself is 128 B; the recvmsg layout
 ; below is reused across multishot completions, with the kernel rewriting
@@ -437,6 +465,86 @@ http_frame:
     xor     eax, eax
     jmp     .ret
 
+; ---- fast_path_classify --------------------------------------------------
+; int fast_path_classify(const Request *r);   rdi = Request*
+;   Returns: 0 (obvious legit), 5 (obvious fraud), or -1 (k-NN required).
+;
+; Conservative deterministic tier-1 rules: ALL conditions must hold for a
+; fast-path verdict.  Mirrors the obvious_legit / obvious_fraud rules from
+; the two leading entries.  Detection-safe: rules only fire on extreme
+; payloads (small + safe-mcc + low-risk customer for legit; high amount +
+; risky-mcc + unknown-merchant for fraud).
+;
+; All comparisons follow `> threshold → fail` semantics (strict), so border
+; values (amount == 500.0 exact) stay in fast-path.  MCC matched as a 4-byte
+; ASCII u32 (the bytes at REQ_MCC are guaranteed to be '0'..'9' digits).
+
+fast_path_classify:
+    ; ---- obvious_legit ----------------------------------------------------
+    cmp     byte [rdi + REQ_KNOWN_MERCHANT], 1
+    jne     .check_fraud
+    cmp     dword [rdi + REQ_INSTALLMENTS], 3
+    jg      .check_fraud
+    cmp     dword [rdi + REQ_TX_COUNT_24H], 5
+    jg      .check_fraud
+    movsd   xmm0, [rdi + REQ_AMOUNT]
+    ucomisd xmm0, [c_legit_max_amount]
+    ja      .check_fraud                 ; amount > 500 → not legit
+    ; ratio: amount / max(customer_avg, 1.0) > 0.5 → not legit
+    movsd   xmm1, [rdi + REQ_CUSTOMER_AVG]
+    movsd   xmm2, [c_one_d_fp]
+    maxsd   xmm1, xmm2                   ; safe_avg = max(avg, 1.0)
+    divsd   xmm0, xmm1
+    ucomisd xmm0, [c_legit_max_ratio]
+    ja      .check_fraud                 ; ratio > 0.5 → not legit
+    movsd   xmm0, [rdi + REQ_KM_HOME]
+    ucomisd xmm0, [c_legit_max_km]
+    ja      .check_fraud                 ; km > 50 → not legit
+    ; safe_mcc ∈ {5411, 5812, 5912, 5311}
+    mov     eax, [rdi + REQ_MCC]
+    cmp     eax, 0x31313435              ; '5','4','1','1' little-endian
+    je      .legit
+    cmp     eax, 0x32313835              ; '5','8','1','2'
+    je      .legit
+    cmp     eax, 0x32313935              ; '5','9','1','2'
+    je      .legit
+    cmp     eax, 0x31313335              ; '5','3','1','1'
+    je      .legit
+    ; fall through — mcc not safe
+
+.check_fraud:
+    ; ---- obvious_fraud ---------------------------------------------------
+    cmp     byte [rdi + REQ_KNOWN_MERCHANT], 0
+    jne     .ambiguous                   ; known merchant → not fraud
+    cmp     dword [rdi + REQ_INSTALLMENTS], 5
+    jl      .ambiguous
+    cmp     dword [rdi + REQ_TX_COUNT_24H], 6
+    jl      .ambiguous
+    movsd   xmm0, [rdi + REQ_AMOUNT]
+    ucomisd xmm0, [c_fraud_min_amount]
+    jb      .ambiguous                   ; amount < 5000 → not fraud
+    movsd   xmm0, [rdi + REQ_KM_HOME]
+    ucomisd xmm0, [c_fraud_min_km]
+    jb      .ambiguous                   ; km < 150 → not fraud
+    ; risky_mcc ∈ {7995, 7801, 7802}
+    mov     eax, [rdi + REQ_MCC]
+    cmp     eax, 0x35393937              ; '7','9','9','5'
+    je      .fraud
+    cmp     eax, 0x31303837              ; '7','8','0','1'
+    je      .fraud
+    cmp     eax, 0x32303837              ; '7','8','0','2'
+    je      .fraud
+
+.ambiguous:
+    mov     eax, -1
+    ret
+.legit:
+    xor     eax, eax
+    ret
+.fraud:
+    mov     eax, 5
+    ret
+
 ; ---- handle_request -------------------------------------------------------
 ; const char *handle_request(const char *buf, int total, int body_off,
 ;                            int body_len, int *out_len);
@@ -490,6 +598,17 @@ handle_request:
     test    eax, eax
     jnz     .post_err                    ; parse_request != 0 → 400
 
+    ; Tier-1 fast-path: deterministic obvious_legit / obvious_fraud rules.
+    ; Sub-200 ns and bypasses both vectorize + scan_cluster on the few
+    ; queries that meet ALL conditions in either bucket.  Returns -1 when
+    ; the verdict is ambiguous — that case falls through to the full k-NN.
+    lea     rdi, [rsp + 0]
+    call    fast_path_classify
+    test    eax, eax
+    js      .knn_path                    ; eax == -1 → ambiguous
+    jmp     .fraud_ok                    ; eax ∈ {0, 5} → done
+
+.knn_path:
     ; vectorize(&req, &q)
     lea     rdi, [rsp + 0]
     lea     rsi, [rsp + 72]
@@ -889,341 +1008,6 @@ recv_client_fds:
     pop     rbx
     ret
 
-; ---- setup_client_fd ------------------------------------------------------
-; void setup_client_fd(int fd);
-;   Configure TCP_NODELAY+TCP_QUICKACK, register in epoll, reset per-fd state.
-;   Returns 0 OK / -1 on error.  Caller may ignore the return (best-effort).
-
-setup_client_fd:
-    push    rbx                          ; fd
-    sub     rsp, 16                       ; locals: optval(4) + epoll_event(12)
-    mov     ebx, edi
-
-    mov     dword [rsp + 0], 1            ; optval = 1
-
-    ; setsockopt(fd, SOL_TCP, TCP_NODELAY, &one, 4)
-    ; NB: syscall arg4 lives in r10, NOT rcx — `syscall` clobbers rcx/r11.
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_NODELAY
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-
-    ; setsockopt(fd, SOL_TCP, TCP_QUICKACK, &one, 4)
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_QUICKACK
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-
-    ; TCP_NOTSENT_LOWAT = 128 — kernel only signals the socket as writable
-    ; once <128 bytes are unacked.  For our short responses this prevents
-    ; buffer bloat that would slow down the first ACK.
-    mov     dword [rsp + 0], 128
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_NOTSENT_LOWAT
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-
-    mov     dword [rsp + 0], 1            ; restore optval=1 for later writes
-
-    ; fcntl(fd, F_SETFL, O_NONBLOCK) — required by edge-triggered epoll.
-    ; In ET mode, recv must be drained until -EAGAIN; that only works on a
-    ; non-blocking fd, otherwise the first drained byte blocks the thread.
-    mov     edi, ebx
-    mov     esi, F_SETFL
-    mov     edx, O_NONBLOCK
-    syscall0 SYS_fcntl
-
-    ; epoll_event { events=EPOLLIN | EPOLLET | EPOLLRDHUP, data.fd=fd }.
-    ;   EPOLLET   — edge-triggered: one CQE per readability transition.
-    ;               Cuts wake-up syscall count under load.
-    ;   EPOLLRDHUP — earlier detection of peer half-close; saves one extra
-    ;               recv→0→close round trip when the client disconnects.
-    mov     dword [rsp + 0], EPOLLIN | EPOLLET | EPOLLRDHUP
-    mov     qword [rsp + 4], 0
-    mov     dword [rsp + 4], ebx          ; data.fd
-
-    mov     edi, [epoll_fd]
-    mov     esi, EPOLL_CTL_ADD
-    mov     edx, ebx
-    lea     r10, [rsp + 0]
-    syscall0 SYS_epoll_ctl
-    test    rax, rax
-    js      .err
-
-    ; conn_state[fd].buf_pos = 0
-    movsxd  rax, ebx
-    imul    rax, rax, STATE_SIZE
-    lea     rdi, [conn_state]
-    add     rdi, rax
-    mov     dword [rdi + STATE_BUF_POS], 0
-
-    xor     eax, eax
-    add     rsp, 16
-    pop     rbx
-    ret
-
-.err:
-    mov     eax, -1
-    add     rsp, 16
-    pop     rbx
-    ret
-
-; ---- close_client_fd ------------------------------------------------------
-; void close_client_fd(int fd);
-;   epoll_ctl_del + close + reset state.buf_pos.
-
-close_client_fd:
-    push    rbx
-    mov     ebx, edi
-
-    mov     edi, [epoll_fd]
-    mov     esi, EPOLL_CTL_DEL
-    mov     edx, ebx
-    xor     r10, r10
-    syscall0 SYS_epoll_ctl
-
-    mov     edi, ebx
-    syscall0 SYS_close
-
-    movsxd  rax, ebx
-    imul    rax, rax, STATE_SIZE
-    lea     rdi, [conn_state]
-    add     rdi, rax
-    mov     dword [rdi + STATE_BUF_POS], 0
-
-    pop     rbx
-    ret
-
-; ---- handle_ctrl_event ----------------------------------------------------
-; int handle_ctrl_event(int ctrl_fd);
-;   Drains one batch of fds from ctrl_fd via recv_client_fds; registers each.
-;   Returns 0 OK / -1 transient error / -2 EOF (LB closed → server should stop).
-
-handle_ctrl_event:
-    push    rbx
-    push    r12
-    push    r13
-    sub     rsp, 64                       ; 8 fds + 4 nfds + pad (rsp 0 mod 16)
-    mov     ebx, edi
-
-    mov     edi, ebx
-    lea     rsi, [rsp + 0]
-    mov     edx, 8
-    lea     rcx, [rsp + 48]               ; &nfds at safe offset (avoid overlap)
-    call    recv_client_fds
-    test    eax, eax
-    js      .err
-    jz      .eof
-
-    mov     r13d, [rsp + 48]              ; nfds
-    xor     r12d, r12d
-.fd_loop:
-    cmp     r12d, r13d
-    jge     .ok
-    mov     edi, [rsp + r12*4]
-    call    setup_client_fd
-    inc     r12d
-    jmp     .fd_loop
-
-.ok:
-    xor     eax, eax
-    jmp     .ret
-.eof:
-    mov     eax, -2
-    jmp     .ret
-.err:
-    mov     eax, -1
-.ret:
-    add     rsp, 64
-    pop     r13
-    pop     r12
-    pop     rbx
-    ret
-
-; ---- handle_client_event --------------------------------------------------
-; void handle_client_event(int fd);
-;   Drain loop for an edge-triggered epoll event:  loop recv() until the
-;   kernel signals -EAGAIN; for every successful read, parse pipelined HTTP
-;   frames and emit responses.  Must drain fully — under EPOLLET, a leftover
-;   byte in the socket buffer waits forever because no new readiness event
-;   will fire until further bytes arrive.
-;   On EOF or hard error: close + epoll_del + reset state.
-
-handle_client_event:
-    push    rbx                          ; fd
-    push    rbp                          ; state ptr
-    push    r12                          ; buf base
-    push    r13                          ; buf_pos cache
-    sub     rsp, 32                       ; locals:
-                                         ;   [+0]  body_off
-                                         ;   [+4]  body_len
-                                         ;   [+8]  total
-                                         ;   [+12] out_len
-                                         ;   [+16] leftover scratch
-
-    mov     ebx, edi
-
-    movsxd  rax, ebx
-    imul    rax, rax, STATE_SIZE
-    lea     rbp, [conn_state]
-    add     rbp, rax
-    mov     r12, rbp                     ; buf base (state starts with buf)
-    mov     r13d, [rbp + STATE_BUF_POS]
-
-.recv_loop:
-    ; If the buffer is full but no frame parsed, refuse to grow (we'd recurse
-    ; forever).  This is the abort path for an oversized request.
-    cmp     r13d, BUF_SIZE
-    jge     .close
-
-    ; recv(fd, buf + buf_pos, BUF_SIZE - buf_pos, MSG_DONTWAIT) — the
-    ; MSG_DONTWAIT mirrors the O_NONBLOCK flag we already set; either
-    ; produces -EAGAIN when the socket is dry, which is our "drained" signal.
-    mov     edi, ebx
-    lea     rsi, [rbp + r13]
-    mov     edx, BUF_SIZE
-    sub     edx, r13d
-    mov     r10d, MSG_DONTWAIT
-    xor     r8, r8
-    xor     r9, r9
-    syscall0 SYS_recvfrom
-
-    test    rax, rax
-    js      .check_err
-    jz      .close                        ; EOF — peer closed cleanly
-
-    add     r13d, eax
-    mov     [rbp + STATE_BUF_POS], r13d
-
-.drain:
-    mov     rdi, r12
-    mov     esi, r13d
-    lea     rdx, [rsp + 0]
-    lea     rcx, [rsp + 4]
-    call    http_frame
-    test    eax, eax
-    jz      .recv_loop                    ; partial frame; recv more bytes
-
-    mov     [rsp + 8], eax               ; total
-
-    mov     rdi, r12
-    mov     esi, eax
-    mov     edx, [rsp + 0]
-    mov     ecx, [rsp + 4]
-    lea     r8, [rsp + 12]
-    call    handle_request
-
-    mov     edi, ebx
-    mov     rsi, rax
-    mov     edx, [rsp + 12]
-    call    send_all
-    test    eax, eax
-    jnz     .close
-
-    ; leftover = buf_pos - total
-    mov     eax, [rsp + 8]
-    mov     r13d, [rbp + STATE_BUF_POS]
-    sub     r13d, eax
-    mov     [rsp + 16], r13d
-    test    r13d, r13d
-    jz      .reset_pos
-
-    movsxd  rdx, eax
-    lea     rsi, [r12 + rdx]
-    mov     rdi, r12
-    movsxd  rcx, r13d
-    cld
-    rep     movsb
-
-.reset_pos:
-    mov     r13d, [rsp + 16]
-    mov     [rbp + STATE_BUF_POS], r13d
-    jmp     .drain                        ; check for another full frame
-                                          ; already in the buffer (pipeline)
-
-.check_err:
-    cmp     rax, -EAGAIN
-    je      .ret                          ; drained — wait for next ET event
-    cmp     rax, -EINTR
-    je      .recv_loop                    ; transient — retry
-    jmp     .close
-
-.close:
-    mov     edi, ebx
-    call    close_client_fd
-
-.ret:
-    add     rsp, 32
-    pop     r13
-    pop     r12
-    pop     rbp
-    pop     rbx
-    ret
-
-; ---- server_loop ----------------------------------------------------------
-; void server_loop(int ctrl_fd);
-;   Runs epoll_wait → dispatch indefinitely until ctrl LB hangs up.
-
-server_loop:
-    push    rbx                          ; ctrl_fd
-    push    rbp                          ; event index
-    push    r12                          ; n events
-    sub     rsp, 8                       ; rsp now 0 mod 16
-
-    mov     ebx, edi
-
-.outer:
-    mov     edi, [epoll_fd]
-    lea     rsi, [events_buf]
-    mov     edx, MAX_EVENTS
-    mov     r10d, -1
-    syscall0 SYS_epoll_wait
-    test    rax, rax
-    js      .check_eintr
-
-    mov     r12d, eax
-    xor     ebp, ebp
-
-.ev_loop:
-    cmp     ebp, r12d
-    jge     .outer
-
-    movsxd  rax, ebp
-    imul    rax, rax, EPOLL_EV_SIZE
-    lea     rcx, [events_buf]
-    mov     edi, [rcx + rax + EPOLL_EV_FD]    ; fd from event.data.fd
-
-    cmp     edi, ebx
-    jne     .client
-
-    call    handle_ctrl_event
-    cmp     eax, -2
-    je      .stop
-    jmp     .next_ev
-.client:
-    call    handle_client_event
-.next_ev:
-    inc     ebp
-    jmp     .ev_loop
-
-.check_eintr:
-    cmp     rax, -EINTR
-    je      .outer
-    ; other error - bail out
-
-.stop:
-    add     rsp, 8
-    pop     r12
-    pop     rbp
-    pop     rbx
-    ret
-
 ; ===========================================================================
 ; io_uring server loop
 ; ===========================================================================
@@ -1273,24 +1057,24 @@ arm_ctrl_recvmsg:
     push    rbx
     mov     ebx, edi
 
-    ; Initialise iov[0] once: { iobuf, 1 }
+    ; Kernel only modifies msg_controllen / msg_namelen / msg_flags of msghdr
+    ; per recvmsg(2).  msg_iov / msg_iovlen / msg_control persist across
+    ; calls, and recvmsg_iov.iov_base / iov_len are constant.  Initialise
+    ; those persistent fields on the first arm only, then every subsequent
+    ; arm just resets msg_controllen (the one field the kernel shrinks).
+    cmp     byte [ctrl_recvmsg_inited], 0
+    jne     .arm_only
+
     lea     rax, [recvmsg_iobuf]
     mov     [recvmsg_iov + 0], rax
     mov     qword [recvmsg_iov + 8], 1
-
-    ; Zero msghdr (56 B → 64 covered by two 32-byte stores)
-    vpxor   xmm0, xmm0, xmm0
-    vmovdqu [recvmsg_hdr + 0],  xmm0
-    vmovdqu [recvmsg_hdr + 16], xmm0
-    vmovdqu [recvmsg_hdr + 32], xmm0
-
-    ; Fields: msg_iov (+16), msg_iovlen (+24), msg_control (+32),
-    ; msg_controllen (+40); name/namelen left zero.
     lea     rax, [recvmsg_iov]
     mov     [recvmsg_hdr + 16], rax
     mov     qword [recvmsg_hdr + 24], 1
     lea     rax, [recvmsg_cmsg]
     mov     [recvmsg_hdr + 32], rax
+    mov     byte [ctrl_recvmsg_inited], 1
+.arm_only:
     mov     qword [recvmsg_hdr + 40], 256
 
     call    get_next_sqe
