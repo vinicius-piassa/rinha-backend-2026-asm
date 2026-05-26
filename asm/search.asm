@@ -484,20 +484,13 @@ search_core:
     cmp     rax, rdi
     je      .done                          ; all tombstoned
 
-    ; If (best_lb << IDX_BITS) >= worst_key, no further cluster can improve
+    ; If (best_lb << IDX_BITS) >= worst_key, no further cluster can improve.
+    ; Conservative cut only (no epsilon inflation): the previous "+50% after
+    ; 10 probes" trick cut wall-clock but introduced FP/FN in the official
+    ; bench (5 errors in 54k = -300 penalty), wiping out the p99 gain.
     mov     rdi, rax
     sar     rdi, CID_BITS                  ; best_lb (non-negative; arithmetic shift OK)
     shl     rdi, IDX_BITS
-
-    ; Adaptive tail cut: once we've already paid for >10 probes, inflate the
-    ; lower bound by +50% so the prune below fires more eagerly.  Trades a
-    ; bit of accuracy on slow queries for a big p99 win.
-    cmp     r15d, 10
-    jle     .check_term
-    mov     rcx, rdi
-    shr     rcx, 1                         ; rcx = best_lb / 2
-    add     rdi, rcx                       ; rdi = best_lb * 3/2
-.check_term:
     cmp     rdi, r14
     jge     .done
 
