@@ -23,8 +23,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.485"
-          memory: "172MB"
+          cpus: "0.475"
+          memory: "171MB"
 
   api2:
     <<: *asm
@@ -38,8 +38,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.485"
-          memory: "172MB"
+          cpus: "0.475"
+          memory: "171MB"
 
   lb:
     <<: *asm
@@ -59,8 +59,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.03"
-          memory: "6MB"
+          cpus: "0.05"
+          memory: "8MB"
 
 volumes:
   sockets:
