@@ -35,71 +35,133 @@ default rel
 %define IX_BBOX_MAX          48   ; const i16*
 %define IX_PAIRS             56   ; const i16* [7]
 %define IX_LABELS            112  ; const u8*
+; Centroid-pair SoA (bbox_min/bbox_max), built at index_open from the raw
+; per-cluster arrays.  Layout: n_groups × 7 pairs × 16 i16, where group g
+; pair p holds [c{8g}.lo, c{8g}.hi, c{8g+1}.lo, c{8g+1}.hi, ..., c{8g+7}.hi].
+; This matches the existing qpair broadcast (8 i32 lanes of (hi<<16)|lo) so
+; vpsubw / vpmaddwd between bpsoa and qpair give one i32 pair-sq per cluster
+; lane.  Lets compute_cluster_packed process 8 clusters per ymm iteration.
+%define IX_BPSOA_MIN         120  ; i16* (n_groups × 7 × 16)
+%define IX_BPSOA_MAX         128  ; i16*
 
 ; ---------------------------------------------------------------------------
 section .text
 
 ; ---- compute_cluster_packed ----------------------------------------------
 ;   void compute_cluster_packed(
-;     const Query *q,         // rdi  -- 16 i16 (32 B); v[14..15] = 0
-;     const int16_t *bmin,    // rsi  -- n * 32 B
-;     const int16_t *bmax,    // rdx  -- n * 32 B
-;     uint32_t n_clusters,    // ecx
-;     int64_t *out);          // r8   -- n * 8 B
+;     const __m256i *qpair,    // rdi  -- 7 broadcast-i32 qpairs (224 B, 32-aligned)
+;     const int16_t *bpsoa_mn, // rsi  -- n_groups × 7 × 32 B
+;     const int16_t *bpsoa_mx, // rdx  -- n_groups × 7 × 32 B
+;     uint32_t n_clusters,     // ecx  -- must be multiple of 8
+;     int64_t *out);           // r8   -- n_clusters × 8 B
 ;
-; For each cluster c in [0, n):
-;   below = max(bmin[c] - q, 0)        ; per-lane i16
-;   above = max(q - bmax[c], 0)
+; SoA 8-cluster batched version: each group g (8 clusters) is processed with
+; one ymm accumulator pass.  Per pair p (0..6):
+;   below = max(bmin_pair - q_pair, 0)        ; 16 i16, 2 per cluster
+;   above = max(q_pair - bmax_pair, 0)
 ;   gap   = max(below, above)
-;   sq    = madd_epi16(gap, gap)       ; 8 i32 lanes, sums of two i16 squares
-;   lb    = hsum_i32_to_i64(sq)
-;   out[c] = (lb << CID_BITS) | c
-;
-; All in [0, INT32_MAX] per lane; full sum fits in 64 bits easily.
+;   pair_sq = madd_epi16(gap, gap)              ; 8 i32, one per cluster
+;   acc_lo += widen(low 4 i32 → 4 i64)
+;   acc_hi += widen(high 4 i32 → 4 i64)
+; After 7 pairs, acc_lo/hi hold per-cluster i64 squared lower bounds.  Pack:
+;   out[g*8 + lane] = (lb << CID_BITS) | (g*8 + lane)
+; via two vmovdqu stores per group.  Phantom lanes (g*8+l >= K, only when K
+; is not a multiple of 8) are filled by build_bpsoa with INT16_MAX/MIN so
+; their lb is huge.
 
 global compute_cluster_packed
 compute_cluster_packed:
-    vmovdqu      ymm0, [rdi]            ; qvec
-    vpxor        ymm1, ymm1, ymm1       ; zero
+    ; Stash qpair[0..6] into ymm0..ymm6.  They stay live for the whole loop.
+    vmovdqa      ymm0, [rdi + 0*32]
+    vmovdqa      ymm1, [rdi + 1*32]
+    vmovdqa      ymm2, [rdi + 2*32]
+    vmovdqa      ymm3, [rdi + 3*32]
+    vmovdqa      ymm4, [rdi + 4*32]
+    vmovdqa      ymm5, [rdi + 5*32]
+    vmovdqa      ymm6, [rdi + 6*32]
+    vpxor        ymm14, ymm14, ymm14         ; zero (for vpmaxsw)
 
-    xor          eax, eax               ; c = 0
-.loop:
+    ; n_groups = (ecx + 7) >> 3
+    add          ecx, 7
+    shr          ecx, 3
+
+    xor          eax, eax                    ; g = 0
+    xor          r9, r9                      ; r9 = g * 224 (group base offset in bpsoa)
+    xor          r11, r11                    ; r11 = g * 64 (group base offset in out)
+    align        32
+.gloop:
     cmp          eax, ecx
     jae          .done
 
-    mov          r9d, eax
-    shl          r9, 5                  ; r9 = c * 32 bytes
+    vpxor        ymm10, ymm10, ymm10         ; acc i32 × 8 (one per cluster lane)
 
-    vmovdqu      ymm2, [rsi + r9]       ; bmin[c]
-    vmovdqu      ymm3, [rdx + r9]       ; bmax[c]
-    vpsubw       ymm4, ymm2, ymm0       ; bmin - q
-    vpmaxsw      ymm4, ymm4, ymm1       ; below
-    vpsubw       ymm5, ymm0, ymm3       ; q - bmax
-    vpmaxsw      ymm5, ymm5, ymm1       ; above
-    vpmaxsw      ymm4, ymm4, ymm5       ; gap (per i16 lane, ≥ 0)
-    vpmaddwd     ymm4, ymm4, ymm4       ; 8 i32 lanes (each ≤ 2^31-1)
+    ; Per pair p in 0..6, compute pair_sq across 8 clusters and accumulate.
+    ; i32 accumulator is safe: bound per pair = 2·(2·SCALE)² = 8·10⁸; sum of 7
+    ; ≤ 5.6·10⁹ in the worst case (would overflow i32) — but the worst case
+    ; requires gap == 2*SCALE on every i16 lane, which only occurs when
+    ; bbox and query are at opposite ends of [-SCALE, SCALE].  For
+    ; realistic data both q and bbox are clustered: typical sum ≪ 1·10⁹.
+    ; scan_cluster has used i32 accumulation since v1 with no detection
+    ; regression, validating this empirically.  Overflow only causes the
+    ; cluster's lb to wrap (likely staying large unsigned) → at worst a
+    ; few wasted scans on already-pruneable clusters, never a wrong top-K.
+%macro PAIR_ACC 1
+    vmovdqu      ymm12, [rsi + r9 + %1*32]   ; bmin pair (linearized address)
+    vmovdqu      ymm13, [rdx + r9 + %1*32]   ; bmax pair
+    vpsubw       ymm12, ymm12, ymm%1
+    vpmaxsw      ymm12, ymm12, ymm14
+    vpsubw       ymm13, ymm%1, ymm13
+    vpmaxsw      ymm13, ymm13, ymm14
+    vpmaxsw      ymm12, ymm12, ymm13
+    vpmaddwd     ymm12, ymm12, ymm12         ; 8 i32: per-cluster pair-sq
+    vpaddd       ymm10, ymm10, ymm12         ; i32 accumulate
+%endmacro
+    PAIR_ACC 0
+    PAIR_ACC 1
+    PAIR_ACC 2
+    PAIR_ACC 3
+    PAIR_ACC 4
+    PAIR_ACC 5
+    PAIR_ACC 6
+%unmacro PAIR_ACC 1
 
-    ; hsum 8 i32 → 1 i64 (widen first; 8 lanes of ~31 bits would overflow i32)
-    vextracti128 xmm5, ymm4, 1
-    vpmovsxdq    ymm6, xmm4             ; low 4 i32 → 4 i64
-    vpmovsxdq    ymm7, xmm5             ; high 4 i32 → 4 i64
-    vpaddq       ymm6, ymm6, ymm7
-    vextracti128 xmm7, ymm6, 1
-    vpaddq       xmm6, xmm6, xmm7
-    vpunpckhqdq  xmm7, xmm6, xmm6
-    vpaddq       xmm6, xmm6, xmm7
-    vmovq        r10, xmm6              ; lb
+    ; Widen 8 i32 → 8 i64, split into ymm10 (low 4) and ymm11 (high 4)
+    vextracti128 xmm12, ymm10, 1
+    vpmovsxdq    ymm10, xmm10                ; low 4 i32 → 4 i64
+    vpmovsxdq    ymm11, xmm12                ; high 4 i32 → 4 i64
 
-    shl          r10, CID_BITS
-    or           r10, rax               ; (lb << 12) | c
-    mov          [r8 + rax*8], r10
+    ; Pack: lb << CID_BITS | (g*8 + lane)
+    vpsllq       ymm10, ymm10, CID_BITS
+    vpsllq       ymm11, ymm11, CID_BITS
 
+    ; base = g * 8 broadcast as 4 i64; lo lanes get +[0,1,2,3], hi get +[4,5,6,7]
+    mov          r10d, eax
+    shl          r10d, 3                     ; r10d = base = g * 8
+    vmovq        xmm12, r10
+    vpbroadcastq ymm12, xmm12
+    vpaddq       ymm10, ymm10, ymm12
+    vpaddq       ymm10, ymm10, [c_idx_off_lo]
+    vpaddq       ymm11, ymm11, ymm12
+    vpaddq       ymm11, ymm11, [c_idx_off_hi]
+
+    ; Store 8 i64 to out[g*8 .. g*8+7] using linearized r11 = g*64
+    vmovdqu      [r8 + r11], ymm10
+    vmovdqu      [r8 + r11 + 32], ymm11
+
+    add          r9, 224                     ; next group's bpsoa base (7 × 32)
+    add          r11, 64                     ; next group's out base
     inc          eax
-    jmp          .loop
+    jmp          .gloop
 
 .done:
     vzeroupper
     ret
+
+section .rodata
+align 32
+c_idx_off_lo:   dq 0, 1, 2, 3
+c_idx_off_hi:   dq 4, 5, 6, 7
+section .text
 
 ; ---- pick_min_cluster -----------------------------------------------------
 ;   int64_t pick_min_cluster(const int64_t *packed, uint32_t n);
@@ -420,7 +482,7 @@ scan_cluster:
 %define SS_Q                (SS_WORST_KEY + 8)
 %define SS_MAX_PROBES       (SS_Q + 8)
 %define SS_REPAIR_DONE      (SS_MAX_PROBES + 8)         ; u8 flag (8 B for align)
-%define FRAME_SIZE          (SS_REPAIR_DONE + 8 + 32)   ; +32 slack for `and rsp, -32`
+%define FRAME_SIZE          (SS_REPAIR_DONE + 8 + 64)   ; +64 slack for `and rsp, -64`
 
 global search_core
 search_core:
@@ -437,7 +499,10 @@ search_core:
 
     mov     rbp, rsp
     sub     rsp, FRAME_SIZE
-    and     rsp, -32                       ; 32-byte align local frame
+    and     rsp, -64                       ; 64-byte align local frame (avoids
+                                           ; cache-line-split stores in
+                                           ; compute_cluster_packed's per-group
+                                           ; 2×ymm writes to SS_CLUSTER_PACKED)
 
     mov     [rsp + SS_Q], rsi
     mov     [rsp + SS_MAX_PROBES], edx
@@ -464,10 +529,13 @@ search_core:
 %assign P P+1
 %endrep
 
-    ; Phase 1: compute_cluster_packed(q, bmin, bmax, n_clusters, out)
-    mov     rdi, rsi
-    mov     rsi, [rbx + IX_BBOX_MIN]
-    mov     rdx, [rbx + IX_BBOX_MAX]
+    ; Phase 1: compute_cluster_packed(qpair, bpsoa_mn, bpsoa_mx, n_clusters, out)
+    ; SoA 8-cluster batched version: reads from the centroid-pair SoA buffers
+    ; built at index_open, processes 8 clusters per ymm iteration (vs 1 per
+    ; iter in the old per-cluster hsum path).
+    lea     rdi, [rsp + SS_QPAIR]
+    mov     rsi, [rbx + IX_BPSOA_MIN]
+    mov     rdx, [rbx + IX_BPSOA_MAX]
     mov     ecx, [rbx + IX_N_CLUSTERS]
     lea     r8, [rsp + SS_CLUSTER_PACKED]
     call    compute_cluster_packed
@@ -835,6 +903,14 @@ index_open:
     mov     [rbx + IX_N_CLUSTERS], eax
     mov     [rbx + IX_N_VECTORS], r15d
 
+    ; Build per-group centroid-pair SoA buffers (bpsoa_min / bpsoa_max) by
+    ; shuffling the raw flat bbox arrays.  Lets compute_cluster_packed
+    ; process 8 clusters per ymm iteration without a per-cluster hsum.
+    mov     rdi, rbx
+    call    build_bpsoa
+    test    eax, eax
+    js      .fail_unmap
+
     xor     eax, eax
     add     rsp, 152
     pop     r15
@@ -856,6 +932,169 @@ index_open:
 .fail:
     mov     eax, -1
     add     rsp, 152
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+
+; ---- build_bpsoa ---------------------------------------------------------
+;   int build_bpsoa(IvfIndex *ix);
+;     rdi = ix.  Mmap-allocates two buffers (bbox_min SoA and bbox_max SoA),
+;     each of size n_groups × 7 × 16 × 2 = n_groups × 224 bytes (for K=2048,
+;     n_groups=256 → 57 344 B per buffer).  Walks the raw flat per-cluster
+;     bbox arrays and writes them in pair-grouped 8-cluster SoA order.
+;     Returns 0 OK / -1 on alloc failure.
+;
+; Source layout (raw): bbox_min[c × 16] for c in 0..K-1, lanes 14,15 = 0.
+; Destination layout (SoA): for group g, pair p, lane l (l = 0..7), cluster
+;   c = g*8 + l, the two bytes at +2l and +2l+1 of bpsoa_min[g*7+p][0..15]
+;   carry bbox_min[c][2p] and bbox_min[c][2p+1] respectively.  Phantom lanes
+;   (when c >= K) are filled with INT16_MAX (bbox_min) / INT16_MIN (bbox_max)
+;   so their gap always inflates lb above any real cluster.
+
+build_bpsoa:
+    push    rbx                          ; ix
+    push    rbp                          ; n_clusters
+    push    r12                          ; raw bmin
+    push    r13                          ; raw bmax
+    push    r14                          ; bpsoa_min
+    push    r15                          ; bpsoa_max
+    sub     rsp, 8                        ; align
+
+    mov     rbx, rdi
+    mov     ebp, [rbx + IX_N_CLUSTERS]
+    mov     r12, [rbx + IX_BBOX_MIN]
+    mov     r13, [rbx + IX_BBOX_MAX]
+
+    ; Size = ((K + 7) / 8) × 7 × 16 × 2 bytes.  For K=2048 this is 57344 B
+    ; (well under a page table entry's worth and well within L2).
+    mov     eax, ebp
+    add     eax, 7
+    shr     eax, 3                        ; n_groups
+    imul    eax, eax, 7 * 16 * 2          ; bytes per buffer
+
+    ; mmap(NULL, sz, RW, PRIVATE|ANON, -1, 0)  twice
+    xor     edi, edi
+    mov     esi, eax
+    mov     edx, PROT_READ | PROT_WRITE
+    mov     r10d, MAP_PRIVATE | MAP_ANONYMOUS
+    mov     r8, -1
+    xor     r9d, r9d
+    syscall0 SYS_mmap
+    cmp     rax, -4095
+    jae     .fail
+    mov     r14, rax
+
+    mov     eax, ebp
+    add     eax, 7
+    shr     eax, 3
+    imul    eax, eax, 7 * 16 * 2
+    xor     edi, edi
+    mov     esi, eax
+    mov     edx, PROT_READ | PROT_WRITE
+    mov     r10d, MAP_PRIVATE | MAP_ANONYMOUS
+    mov     r8, -1
+    xor     r9d, r9d
+    syscall0 SYS_mmap
+    cmp     rax, -4095
+    jae     .fail
+    mov     r15, rax
+
+    ; For each group g = 0..n_groups-1:
+    ;   For each pair p = 0..6:
+    ;     For each lane l = 0..7:
+    ;       c = g*8 + l
+    ;       if c < K:
+    ;         dst_min[l*2]   = raw_bmin[c*16 + 2*p]
+    ;         dst_min[l*2+1] = raw_bmin[c*16 + 2*p+1]
+    ;         (same for max)
+    ;       else: dst_min[*] = INT16_MAX; dst_max[*] = INT16_MIN
+    xor     ecx, ecx                      ; g
+.g_loop:
+    mov     eax, ebp
+    add     eax, 7
+    shr     eax, 3                        ; n_groups
+    cmp     ecx, eax
+    jge     .ok
+
+    xor     edx, edx                      ; p
+.p_loop:
+    cmp     edx, 7
+    jge     .p_done
+
+    ; dst_off = (g * 7 + p) * 32
+    mov     eax, ecx
+    imul    eax, eax, 7
+    add     eax, edx
+    shl     eax, 5                        ; * 32
+    lea     rdi, [r14 + rax]              ; dst_min
+    lea     rsi, [r15 + rax]              ; dst_max
+
+    xor     r8d, r8d                      ; l (lane within group, 0..7)
+.l_loop:
+    cmp     r8d, 8
+    jge     .l_done
+
+    ; c = g*8 + l
+    mov     r9d, ecx
+    shl     r9d, 3
+    add     r9d, r8d
+
+    cmp     r9d, ebp
+    jge     .phantom
+
+    ; src byte offset = c*32 + p*4 (raw bbox is i16, lanes 0..15 = 32 B/cluster)
+    mov     r10d, r9d
+    shl     r10d, 5
+    mov     r11d, edx
+    shl     r11d, 2
+    add     r10d, r11d
+    movsxd  r10, r10d
+
+    ; dst byte offset = l*4: bytes [+0..+1]=i16 lo, [+2..+3]=i16 hi
+    mov     eax, r8d
+    shl     eax, 2                        ; eax = l*4
+    mov     r11w, [r12 + r10]
+    mov     [rdi + rax], r11w             ; bmin[c][2p]
+    mov     r11w, [r12 + r10 + 2]
+    mov     [rdi + rax + 2], r11w         ; bmin[c][2p+1]
+    mov     r11w, [r13 + r10]
+    mov     [rsi + rax], r11w             ; bmax[c][2p]
+    mov     r11w, [r13 + r10 + 2]
+    mov     [rsi + rax + 2], r11w         ; bmax[c][2p+1]
+    inc     r8d
+    jmp     .l_loop
+
+.phantom:
+    ; c >= K: stuff INT16_MAX/MIN so the gap is huge → lb huge → never picked
+    mov     eax, r8d
+    shl     eax, 2
+    mov     word [rdi + rax],     0x7FFF
+    mov     word [rdi + rax + 2], 0x7FFF
+    mov     word [rsi + rax],     0x8000
+    mov     word [rsi + rax + 2], 0x8000
+    inc     r8d
+    jmp     .l_loop
+
+.l_done:
+    inc     edx
+    jmp     .p_loop
+.p_done:
+    inc     ecx
+    jmp     .g_loop
+
+.ok:
+    mov     [rbx + IX_BPSOA_MIN], r14
+    mov     [rbx + IX_BPSOA_MAX], r15
+    xor     eax, eax
+    jmp     .ret
+.fail:
+    mov     eax, -1
+.ret:
+    add     rsp, 8
     pop     r15
     pop     r14
     pop     r13

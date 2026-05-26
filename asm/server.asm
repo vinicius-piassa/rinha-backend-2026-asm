@@ -50,7 +50,9 @@ extern uring_register_pbuf_ring
 %define IX_BBOX_MAX          48
 %define IX_PAIRS             56
 %define IX_LABELS            112
-%define IX_SIZE              120
+%define IX_BPSOA_MIN         120
+%define IX_BPSOA_MAX         128
+%define IX_SIZE              136
 
 ; ===========================================================================
 section .rodata
