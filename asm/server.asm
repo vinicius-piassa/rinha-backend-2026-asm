@@ -2100,33 +2100,12 @@ _start:
     syscall0 SYS_sched_setscheduler
     add     rsp, 16
 
-    ; Pin to the lowest-numbered CPU the cgroup allows, eliminating cross-core
-    ; L1/LLC ping-pong as the kernel re-balances within a cpuset.  The cgroup
-    ; restricts us to e.g. {0,1} for api1; we pick CPU 0 from that set.
-    ; Best-effort: a failed setaffinity leaves the kernel default in place.
-    sub     rsp, 16
-    mov     qword [rsp + 0], 0
-    mov     qword [rsp + 8], 0
-    xor     edi, edi                       ; pid = 0 → self
-    mov     esi, 8                         ; cpusetsize = 8 B (64 CPUs)
-    lea     rdx, [rsp + 0]
-    syscall0 SYS_sched_getaffinity
-    test    rax, rax
-    js      .skip_pin                       ; getaffinity failed (unlikely)
-    mov     rax, [rsp + 0]
-    test    rax, rax
-    jz      .skip_pin                       ; empty mask shouldn't happen
-    bsf     rcx, rax                        ; lowest set CPU
-    mov     rdx, 1
-    shl     rdx, cl                         ; new mask = 1 << lowest_cpu
-    mov     [rsp + 0], rdx
-    mov     qword [rsp + 8], 0
-    xor     edi, edi
-    mov     esi, 8
-    lea     rdx, [rsp + 0]
-    syscall0 SYS_sched_setaffinity          ; ignore return
-.skip_pin:
-    add     rsp, 16
+    ; (sched_setaffinity removed — on the Mac Mini target the cgroup
+    ; cpuset already constrains us to one physical core's two HT siblings,
+    ; and pinning to a single sibling forced api1 and lb to serialize on
+    ; CPU 0.  Letting the kernel balance within the cpuset lets api1 and
+    ; lb run in parallel on HT siblings of the same physical core, with
+    ; shared L1d giving lb→api fd-passing a warm cache.)
 
     call    mcc_init
 
