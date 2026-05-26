@@ -131,8 +131,16 @@ err_resp_len   equ $ - err_resp
 ; Lowercase reference for case-insensitive Content-Length header detection.
 str_cl_lower: db "content-length:"           ; 15 bytes; no NUL
 
-default_index_path: db "index.bin", 0
-usage_msg:          db "usage: asm-server <uds_path> [index_path]", 10
+; Default per-partition index paths.  Server loads all 4 at startup; queries
+; are routed by partition tag (unknown_merchant × has_last_tx ∈ 0..3).
+default_index_p0: db "index_p0.bin", 0
+default_index_p1: db "index_p1.bin", 0
+default_index_p2: db "index_p2.bin", 0
+default_index_p3: db "index_p3.bin", 0
+align 8
+default_index_paths: dq default_index_p0, default_index_p1, default_index_p2, default_index_p3
+
+usage_msg:          db "usage: asm-server <uds_path>", 10
 usage_msg_len  equ $ - usage_msg
 err_index_msg:      db "error: failed to open index", 10
 err_index_msg_len equ $ - err_index_msg
@@ -164,10 +172,11 @@ warm_body_len      equ warm_http_end - warm_body
 ; ===========================================================================
 section .bss
 
-; Read-only after server startup populates it (via index_open / external).
-global g_index
-alignb 8
-g_index:    resb IX_SIZE
+; Read-only after server startup populates them.  Four sub-indices, one per
+; (unknown_merchant, has_last_tx) partition tag.  Indexed by tag ∈ 0..3.
+global g_indices
+alignb 64
+g_indices:  resb N_PARTITIONS * IX_SIZE
 
 alignb 16
 conn_state: resb MAX_FDS * STATE_SIZE       ; ~4.2 MB; indexed by fd
@@ -614,8 +623,16 @@ handle_request:
     lea     rsi, [rsp + 72]
     call    vectorize
 
-    ; fraud = search(&g_index, &q)
-    lea     rdi, [g_index]
+    ; Derive partition tag = (unknown << 1) | has_last from Request.  Then
+    ; route the search to the matching sub-index.  unknown = 1 - known.
+    movzx   eax, byte [rsp + REQ_KNOWN_MERCHANT]   ; 1 if known, 0 if unknown
+    xor     eax, 1                                  ; flip → unknown bit
+    shl     eax, 1
+    movzx   ecx, byte [rsp + REQ_HAS_LAST_TX]
+    or      eax, ecx                                ; eax = tag ∈ 0..3
+    imul    eax, eax, IX_SIZE
+    lea     rdi, [g_indices]
+    add     rdi, rax                                ; rdi = &g_indices[tag]
     lea     rsi, [rsp + 72]
     call    search
     movzx   eax, al                      ; fraud in low byte, zero-ext
@@ -1827,7 +1844,13 @@ warm_index:
     jmp     .fill
 .fill_done:
 
-    lea     rdi, [g_index]
+    ; warm: cycle through all 4 partitions so each one's pair_arrays + bpsoa
+    ; pages get touched during boot.  Use ebx & 3 as the rotating index.
+    mov     eax, ebx
+    and     eax, N_PARTITIONS - 1
+    imul    eax, eax, IX_SIZE
+    lea     rdi, [g_indices]
+    add     rdi, rax
     mov     rsi, rsp
     call    search                       ; ignore return
 
@@ -1850,14 +1873,9 @@ _start:
     cmp     r12, 2
     jl      .usage
 
-    mov     r14, [rsp + 16]              ; argv[1]
-    cmp     r12, 3
-    jl      .default_index
-    mov     r15, [rsp + 24]              ; argv[2]
-    jmp     .have_paths
-.default_index:
-    lea     r15, [default_index_path]
-.have_paths:
+    mov     r14, [rsp + 16]              ; argv[1] = UDS path
+    ; argv[2] is no longer used (4 per-partition indices loaded from
+    ; hard-coded default paths).  Keep CLI compat: extra args ignored.
 
     ; Tighten this thread's timer slack from default 50 µs → 1 ns.  No cap
     ; required (a process can always shrink its own slack).  Cuts scheduler
@@ -1895,11 +1913,26 @@ _start:
 
     call    mcc_init
 
-    lea     rdi, [g_index]
-    mov     rsi, r15
+    ; Open all 4 partition indices into g_indices[0..3].  Any failure
+    ; aborts startup — partitioned routing requires all 4 present.
+    xor     r13d, r13d                       ; partition iter i
+.open_loop:
+    cmp     r13d, N_PARTITIONS
+    jge     .open_done
+    mov     eax, r13d
+    imul    eax, eax, IX_SIZE
+    lea     rdi, [g_indices]
+    add     rdi, rax                         ; &g_indices[i]
+    lea     rax, [default_index_paths]
+    mov     rsi, [rax + r13*8]               ; path string
+    push    r13                              ; preserve across call
     call    index_open
+    pop     r13
     test    eax, eax
     js      .fail_index
+    inc     r13d
+    jmp     .open_loop
+.open_done:
 
     ; Warm path, ordered cheapest → hottest so the L1i / branch predictors
     ; end up primed with the production request flow (the last thing run):

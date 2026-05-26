@@ -16,7 +16,7 @@ services:
     command:
       - /asm_server
       - /sockets/api1.sock
-      - /index.bin
+    working_dir: /
     volumes:
       - sockets:/sockets
     cpuset: "0,1"
@@ -31,7 +31,7 @@ services:
     command:
       - /asm_server
       - /sockets/api2.sock
-      - /index.bin
+    working_dir: /
     volumes:
       - sockets:/sockets
     cpuset: "2,3"

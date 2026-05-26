@@ -1076,14 +1076,117 @@ section .text
 
 %define KMEANS_ITERS     20
 
+; ---- filter_refs_by_tag --------------------------------------------------
+; size_t filter_refs_by_tag(void *refs, size_t n, int partition_tag);
+;   rdi = refs ptr, rsi = n, edx = tag (0..3)
+;   Returns rax = new n after compacting in place to keep only refs whose
+;   (unknown_merchant, has_last_tx) matches the partition tag.
+;
+; tag encoding: ((vec[11] > 0.5) << 1) | (vec[5] >= 0)
+;   tag=0 -> known + no_last     (vec[11] <= 0.5, vec[5] <  0)
+;   tag=1 -> known + has_last    (vec[11] <= 0.5, vec[5] >= 0)
+;   tag=2 -> unknown + no_last   (vec[11] >  0.5, vec[5] <  0)
+;   tag=3 -> unknown + has_last  (vec[11] >  0.5, vec[5] >= 0)
+;
+; Ref layout: 14 f32 starting at +0 (REF_VEC_OFF=0); 64 B per ref.
+; vec[5] at byte offset 20, vec[11] at byte offset 44.
+;
+; Stable in-place compaction (single pass).  Source/dest indices use rep movsq
+; (8 qwords = 64 B per ref).
+
+global filter_refs_by_tag
+filter_refs_by_tag:
+    push    rbx                          ; refs base
+    push    rbp                          ; n
+    push    r12                          ; tag
+    push    r13                          ; src index
+    push    r14                          ; dst index
+    push    r15                          ; scratch (zero, half)
+
+    mov     rbx, rdi
+    mov     rbp, rsi
+    mov     r12d, edx
+
+    xor     r13, r13                     ; src = 0
+    xor     r14, r14                     ; dst = 0
+    pxor    xmm2, xmm2                   ; zero (for vec[5] >= 0 compare)
+    movss   xmm3, [c_half_f]             ; 0.5 (for vec[11] > 0.5 compare)
+.loop:
+    cmp     r13, rbp
+    jge     .done
+
+    mov     rax, r13
+    shl     rax, 6                       ; src offset
+    lea     rdi, [rbx + rax]
+
+    ; Compute tag for this ref.  unknown = vec[11] > 0.5, has_last = vec[5] >= 0
+    movss   xmm0, [rdi + 20]             ; vec[5]
+    movss   xmm1, [rdi + 44]             ; vec[11]
+    xor     ecx, ecx
+    ucomiss xmm1, xmm3
+    seta    cl                            ; cl = 1 if vec[11] > 0.5
+    shl     ecx, 1
+    xor     r15d, r15d
+    ucomiss xmm0, xmm2
+    setae   r15b                          ; r15b = 1 if vec[5] >= 0
+    or      ecx, r15d
+    ; ecx = current tag (0..3)
+    cmp     ecx, r12d
+    jne     .skip
+
+    ; Match — copy ref from src to dst (only if src != dst).
+    cmp     r13, r14
+    je      .keep_inplace
+    mov     rcx, r14
+    shl     rcx, 6
+    lea     rsi, [rbx + rax]             ; src ptr
+    lea     rdi, [rbx + rcx]             ; dst ptr
+    ; 64 B copy via 4 xmm loads/stores (faster than rep movsq for small N)
+    movdqu  xmm4, [rsi]
+    movdqu  xmm5, [rsi + 16]
+    movdqu  xmm6, [rsi + 32]
+    movdqu  xmm7, [rsi + 48]
+    movdqu  [rdi],      xmm4
+    movdqu  [rdi + 16], xmm5
+    movdqu  [rdi + 32], xmm6
+    movdqu  [rdi + 48], xmm7
+.keep_inplace:
+    inc     r14
+.skip:
+    inc     r13
+    jmp     .loop
+
+.done:
+    mov     rax, r14                     ; new n
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
+
+section .rodata
+align 4
+c_half_f:    dd 0x3F000000               ; 0.5 f32
+section .text
+
 global _start
 _start:
-    mov     r12, [rsp]                   ; argc
-    cmp     r12, 3
+    mov     rax, [rsp]                   ; argc
+    cmp     rax, 4                       ; need: input output tag
     jl      .usage
 
     mov     r14, [rsp + 16]              ; argv[1] = input
     mov     r15, [rsp + 24]              ; argv[2] = output
+    ; Parse argv[3] as single-digit partition tag (0..3).  r12 is callee-save
+    ; under SysV (and the syscall path here preserves it), so this value
+    ; survives every call through the pipeline.
+    mov     rax, [rsp + 32]
+    movzx   r12d, byte [rax]
+    sub     r12d, '0'
+    cmp     r12d, N_PARTITIONS
+    jae     .usage
 
     ; Open input file
     mov     rdi, r14
@@ -1163,7 +1266,15 @@ _start:
     call    parse_refs
     test    rax, rax
     js      .err_parse
-    mov     [rsp + 24], rax              ; n_refs
+
+    ; Filter refs in place by partition tag (in r12d).  Refs not matching
+    ; the tag are discarded; remaining ones compacted into the front of the
+    ; buffer.  Returns new n_refs ≤ original.
+    mov     rdi, [rsp + 16]
+    mov     rsi, rax
+    mov     edx, r12d
+    call    filter_refs_by_tag
+    mov     [rsp + 24], rax              ; n_refs (post-filter)
 
     ; Allocate centroids, assignments, cluster_offsets, order, cursor, bbox_*
     mov     rdi, CENTROIDS_BYTES

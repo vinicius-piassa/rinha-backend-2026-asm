@@ -35,7 +35,10 @@ FROM scratch
 
 COPY --from=asm-builder /src/asm/build/asm_lb     /asm_lb
 COPY --from=asm-builder /src/asm/build/asm_server /asm_server
-COPY index.bin                                    /index.bin
+COPY index_p0.bin                                 /index_p0.bin
+COPY index_p1.bin                                 /index_p1.bin
+COPY index_p2.bin                                 /index_p2.bin
+COPY index_p3.bin                                 /index_p3.bin
 
 # Default to LB so `docker run rinha-asm` does something sensible.
 ENTRYPOINT []

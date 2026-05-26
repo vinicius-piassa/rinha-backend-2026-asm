@@ -53,6 +53,15 @@
 %define N_DIMS        14
 %define N_CLUSTERS    2048
 %define K_NEIGHBORS   5
+
+; ---- Partitioned index --------------------------------------------------
+; The reference set is split into 4 sub-indices by (unknown_merchant,
+; has_last_tx).  Top-5 nearest neighbors share both tags in 100% of
+; 5000 sampled queries (i16-quantized), so partition routing is
+; detection-safe.  Each partition is built as a separate index.bin file
+; with its own K (sized proportional to partition vector count).  The
+; server loads all 4 at startup and routes queries by tag at runtime.
+%define N_PARTITIONS  4
 ; Initial probe budget; if top-5 label count falls in [NPROBE_REPAIR_MIN,
 ; NPROBE_REPAIR_MAX] (ambiguous), the probe loop extends to N_CLUSTERS so
 ; the lb-prune can run a full sweep.  The repair phase continues across the full sweep.
