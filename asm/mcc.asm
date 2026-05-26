@@ -2,13 +2,18 @@
 ;
 ; Public API (System V AMD64):
 ;   void    mcc_init(void)
-;     Initializes the 10 000-entry i16 table. Default 5000 (= 0.5 risk),
-;     with 10 challenge overrides. Idempotent. Call once at startup.
+;     No-op now (kept for ABI compatibility).  Override tables are static
+;     .rodata; no init step required.
 ;
 ;   int16_t mcc_risk_i16(const char *mcc4)
 ;     rdi -> pointer to exactly 4 ASCII digit bytes.
 ;     Returns the i16 risk in eax (sign-extended).
 ;     No validation: caller guarantees the four bytes are '0'..'9'.
+;
+; Implementation: the prior 20 KB i16-by-MCC table was ~63% of Haswell L1d
+; and got touched at most once per request — cold-line eviction pressure on
+; everything else (top-K state, pair_base, msgpool).  Replaced with a 64-B
+; (one cache line) AVX2 compare against 9 real overrides + default 5000.
 
 bits 64
 default rel
@@ -17,31 +22,24 @@ default rel
 %include "macros.inc"
 
 ; ---------------------------------------------------------------------------
-section .bss
-align 64
-mcc_table:  resw 10000              ; 20 000 B — fits L1d (32 KB on Haswell)
+section .rodata
+align 32
+; 16 × u16 = 32 B = one ymm.  Real overrides are the first 9 entries; the
+; rest are sentinels 0xFFFF (> max valid MCC 9999) that never match.
+override_keys:
+    dw  5411, 5812, 5912, 5944, 7801, 7802, 7995, 4511
+    dw  5311, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+
+align 32
+override_vals:
+    dw  1500, 3000, 2000, 4500, 8000, 7500, 8500, 3500
+    dw  2500,    0,    0,    0,    0,    0,    0,    0
 
 ; ---------------------------------------------------------------------------
 section .text
 
 global mcc_init
 mcc_init:
-    cld
-    lea     rdi, [mcc_table]
-    mov     ax, 5000
-    mov     ecx, 10000
-    rep     stosw
-
-    mov     word [mcc_table + 5411*2], 1500
-    mov     word [mcc_table + 5812*2], 3000
-    mov     word [mcc_table + 5912*2], 2000
-    mov     word [mcc_table + 5944*2], 4500
-    mov     word [mcc_table + 7801*2], 8000
-    mov     word [mcc_table + 7802*2], 7500
-    mov     word [mcc_table + 7995*2], 8500
-    mov     word [mcc_table + 4511*2], 3500
-    mov     word [mcc_table + 5311*2], 2500
-    mov     word [mcc_table + 5999*2], 5000
     ret
 
 global mcc_risk_i16
@@ -59,9 +57,23 @@ mcc_risk_i16:
     lea     edx, [rdx + rdx*4]      ; edx *= 5
     add     eax, ecx
     lea     eax, [rax + rdx*2]      ; eax += 10*m[2]
-    add     eax, r8d                ; eax += m[3]
-    lea     rcx, [mcc_table]
-    movsx   eax, word [rcx + rax*2]
+    add     eax, r8d                ; eax = MCC (0..9999)
+
+    ; AVX2 broadcast-compare against 16-entry override table.
+    vmovd        xmm0, eax
+    vpbroadcastw ymm0, xmm0
+    vmovdqa      ymm1, [override_keys]
+    vpcmpeqw     ymm0, ymm0, ymm1
+    vpmovmskb    eax, ymm0
+    test         eax, eax
+    jz           .default
+    tzcnt        eax, eax
+    shr          eax, 1              ; byte-pos → u16 index
+    lea          rcx, [override_vals]
+    movsx        eax, word [rcx + rax*2]
+    ret
+.default:
+    mov          eax, 5000
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits

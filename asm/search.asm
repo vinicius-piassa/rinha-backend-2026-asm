@@ -297,6 +297,14 @@ scan_cluster:
     add     rdi, r15
     mov     [rsp + 128], rdi
 
+    ; INT32_MAX broadcast for unsigned saturation of `partial` in the early
+    ; gate.  Without this, partial (which can reach ~5.6e9 worst case) wraps
+    ; to a negative i32, and the signed vpcmpgtd reports false-non-skip,
+    ; causing the gate to keep scanning batches it could have pruned.
+    mov     eax, 0x7FFFFFFF
+    vmovd   xmm15, eax
+    vpbroadcastd ymm15, xmm15
+
     xor     rcx, rcx                       ; i = 0 (vector index, batches of 8)
 
     align   32                              ; let DSB capture the hot loop body
@@ -335,6 +343,7 @@ scan_cluster:
     vpbroadcastd ymm9, xmm9                  ; thresh broadcast as 8 i32
 
     vpaddd   ymm14, ymm7, ymm13              ; partial = sA + sB
+    vpminud  ymm14, ymm14, ymm15             ; saturate at INT32_MAX (anti-wrap)
     vpcmpgtd ymm10, ymm9, ymm14
     vptest   ymm10, ymm10
     jz       .next_batch_skip
@@ -343,6 +352,7 @@ scan_cluster:
     PAIR_ADD 1, 13
 
     vpaddd   ymm14, ymm7, ymm13
+    vpminud  ymm14, ymm14, ymm15             ; saturate at INT32_MAX (anti-wrap)
     vpcmpgtd ymm10, ymm9, ymm14
     vptest   ymm10, ymm10
     jz       .next_batch_skip

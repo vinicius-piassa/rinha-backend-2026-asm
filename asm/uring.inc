@@ -277,5 +277,6 @@
 %define UD_OP_RECVMSG   (4 << UD_OP_SHIFT)
 %define UD_OP_SENDMSG   (5 << UD_OP_SHIFT)
 %define UD_OP_ACCEPT    (6 << UD_OP_SHIFT)
+%define UD_OP_CANCEL    (7 << UD_OP_SHIFT)
 
 %endif ; URING_INC

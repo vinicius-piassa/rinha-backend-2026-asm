@@ -97,7 +97,12 @@ reg_files:      resd (MAX_BACKENDS + 1)
 ;   +24  cmsg   (CMSG_SPACE(sizeof(int)) = 24 B for one fd)
 ;   +48  msghdr (56 B)
 ;   +104 pad
-%define MSGPOOL_SIZE     32                  ; power of 2
+; SQ size is 1024 (lb_loop_uring init); each accept consumes up to 2 SQEs
+; (sendmsg + close), so worst-case ~512 sendmsg SQEs can be in-flight
+; concurrently reading their msghdr/iov/cmsg from the pool.  Pool must be at
+; least that big to avoid the kernel reading a recycled entry under bursty
+; accept traffic.  512 * 128 = 64 KB — trivial.
+%define MSGPOOL_SIZE     512                 ; power of 2; ≥ SQ_SIZE/2
 %define MSGPOOL_MASK     (MSGPOOL_SIZE - 1)
 %define MSGPOOL_ENTRY    128
 %define MSGPOOL_BYTES    (MSGPOOL_SIZE * MSGPOOL_ENTRY)
@@ -108,6 +113,15 @@ reg_files:      resd (MAX_BACKENDS + 1)
 alignb 64
 msgpool:        resb MSGPOOL_BYTES
 msgpool_cursor: resd 1
+
+; Consecutive sendmsg/close error count (errors silenced via CQE_SKIP_SUCCESS
+; surface here when the kernel sends a CQE for the failed op).  Reset on
+; success path is impractical (success CQEs are suppressed), so we treat
+; this as a sticky fault counter — once it exceeds the threshold we exit so
+; the container supervisor (docker compose restart_policy) brings us back up
+; instead of silently round-robin-ing onto a dead backend forever.
+sendmsg_err_count: resd 1
+%define SENDMSG_ERR_LIMIT 256
 
 ; ===========================================================================
 section .text
@@ -651,7 +665,7 @@ handle_accept_cqe:
     ; --- submit close(client_fd) SQE
     call    lb_get_next_sqe
     test    rax, rax
-    jz      .skip_close
+    jz      .rollback_sendmsg            ; close alloc failed after sendmsg
     SQE_ZERO rax
     mov     byte [rax + SQE_OPCODE], IORING_OP_CLOSE
     mov     byte [rax + SQE_FLAGS], IOSQE_CQE_SKIP_SUCCESS
@@ -676,8 +690,22 @@ handle_accept_cqe:
     ret
 
 .skip_close:
-    ; Fall back to a blocking close so we never leak the fd.  Should be
-    ; vanishingly rare (would need ≥256 in-flight ops).
+    ; sendmsg SQE alloc itself failed: no rollback needed.  Blocking-close
+    ; the fd locally so we never leak; the client just sees a connection
+    ; drop, which is the correct behaviour under SQ exhaustion.
+    mov     edi, ebx
+    syscall0 SYS_close
+    jmp     .recheck_more
+
+.rollback_sendmsg:
+    ; Close SQE alloc failed AFTER the sendmsg SQE was already filled in.
+    ; The sendmsg has IOSQE_IO_HARDLINK set — if we just leave it, when the
+    ; ring is later submitted its link target becomes whatever SQE happens
+    ; to be allocated next (from arm_accept or another accept handler),
+    ; corrupting that chain.  Undo by decrementing the cached tail so the
+    ; sendmsg SQE is treated as never having been emitted.  Then blocking-
+    ; close the client fd.
+    dec     dword [g_ring + URING_SQ_TAIL_CACHED]
     mov     edi, ebx
     syscall0 SYS_close
     jmp     .recheck_more
@@ -726,10 +754,20 @@ lb_loop_uring:
     cmp     eax, UD_OP_ACCEPT >> UD_OP_SHIFT
     je      .h_accept
     ; UD_OP_SENDMSG / UD_OP_CLOSE only fire on errors (we set CQE_SKIP_SUCCESS).
-    ; Just drop them — we already submitted both ops together so a missing
-    ; close is recoverable at the kernel level (the fd gets closed on process
-    ; exit if it ever leaks, which it won't in practice).
-    jmp     .next
+    ; Close errors are benign (peer RST, double-close races) — silently drop.
+    ; Only sendmsg failures indicate a dead API ctrl_fd; count those toward
+    ; the exit budget.  Limit raised to 256 to absorb transient kernel noise
+    ; over a multi-million-accept run without spurious exits.
+    test    esi, esi
+    jns     .next                        ; res >= 0: not an error, ignore
+    cmp     eax, UD_OP_SENDMSG >> UD_OP_SHIFT
+    jne     .next                        ; only sendmsg errors count
+    inc     dword [sendmsg_err_count]
+    cmp     dword [sendmsg_err_count], SENDMSG_ERR_LIMIT
+    jb      .next
+    ; Exhausted error budget — exit so the supervisor restarts us.
+    mov     edi, 2
+    syscall0 SYS_exit_group
 
 .h_accept:
     ; For accept, cqe.res IS the new client fd.  Override rdi with res.

@@ -308,7 +308,20 @@ parse_content_length_line:
     lea     ecx, [ecx + ecx*4]           ; n *= 5
     lea     ecx, [eax + ecx*2]           ; n = 10*n + digit
     inc     r9
-    jmp     .digit_loop
+    cmp     ecx, BUF_SIZE
+    jbe     .digit_loop
+    ; Saturate above BUF_SIZE to keep n*hsz arithmetic safe in http_frame
+    ; and force the request into the incomplete/oversize bucket.
+    mov     ecx, BUF_SIZE + 1
+.eat_oversized:
+    cmp     r9, rsi
+    jae     .digits_done
+    movzx   eax, byte [r9]
+    sub     eax, '0'
+    cmp     eax, 9
+    ja      .digits_done
+    inc     r9
+    jmp     .eat_oversized
 
 .digits_done:
     mov     [rdx], ecx                   ; *out = n
@@ -344,26 +357,66 @@ http_frame:
     movsxd  r13, esi                     ; len as i64
 
     ; --- find CRLFCRLF -----------------------------------------------------
+    ; AVX2: scan 32-byte chunks with 4 shifted unaligned loads against
+    ; broadcast(CR)/broadcast(LF), ANDed → mask of CRLFCRLF starts.  Each
+    ; iter advances by 32, but needs rcx+34 < len for the +3 load — last
+    ; <35 bytes drained byte-by-byte.
+    mov     eax, 0x0D
+    vmovd   xmm14, eax
+    vpbroadcastb ymm14, xmm14            ; ymm14 = CR broadcast
+    mov     eax, 0x0A
+    vmovd   xmm13, eax
+    vpbroadcastb ymm13, xmm13            ; ymm13 = LF broadcast
+
     xor     ecx, ecx                     ; i = 0
-.crlf_scan:
+.crlf_simd:
+    ; Need rcx + 35 ≤ len for the +3 unaligned ymm read to stay in-bounds.
+    mov     rax, rcx
+    add     rax, 35
+    cmp     rax, r13
+    jg      .crlf_tail
+
+    vmovdqu  ymm0, [rbx + rcx]
+    vmovdqu  ymm1, [rbx + rcx + 1]
+    vmovdqu  ymm2, [rbx + rcx + 2]
+    vmovdqu  ymm3, [rbx + rcx + 3]
+    vpcmpeqb ymm0, ymm0, ymm14           ; CR at offset 0
+    vpcmpeqb ymm1, ymm1, ymm13           ; LF at offset 1
+    vpcmpeqb ymm2, ymm2, ymm14           ; CR at offset 2
+    vpcmpeqb ymm3, ymm3, ymm13           ; LF at offset 3
+    vpand    ymm0, ymm0, ymm1
+    vpand    ymm2, ymm2, ymm3
+    vpand    ymm0, ymm0, ymm2
+    vpmovmskb eax, ymm0
+    test     eax, eax
+    jz       .crlf_advance
+    tzcnt    edx, eax
+    add      rcx, rdx                     ; i = chunk_base + first match
+    lea      r14, [rbx + rcx]
+    jmp      .have_he
+.crlf_advance:
+    add      rcx, 32
+    jmp      .crlf_simd
+
+.crlf_tail:
+    ; Byte-by-byte for the last <35 bytes.
     mov     rax, rcx
     add     rax, 3
     cmp     rax, r13
-    jge     .no_crlf                     ; i + 3 < len? need: i + 3 < len → i+3 ≤ len-1 → i+3 < len
-    ; Strict less-than: we need 4 bytes at offsets i..i+3.
+    jge     .no_crlf
     cmp     byte [rbx + rcx], 13
-    jne     .crlf_next
+    jne     .crlf_tail_next
     cmp     byte [rbx + rcx + 1], 10
-    jne     .crlf_next
+    jne     .crlf_tail_next
     cmp     byte [rbx + rcx + 2], 13
-    jne     .crlf_next
+    jne     .crlf_tail_next
     cmp     byte [rbx + rcx + 3], 10
-    jne     .crlf_next
-    lea     r14, [rbx + rcx]             ; he = buf + i
+    jne     .crlf_tail_next
+    lea     r14, [rbx + rcx]
     jmp     .have_he
-.crlf_next:
+.crlf_tail_next:
     inc     rcx
-    jmp     .crlf_scan
+    jmp     .crlf_tail
 
 .no_crlf:
     xor     eax, eax                     ; return 0
@@ -587,11 +640,13 @@ handle_request:
     ;   [rsp + 112] = phase_start_tsc
     ; Saved here before any phase call so they survive callee clobbers.
 
-    ; --- POST? (total >= 5 && buf[0..3] == "POST") ------------------------
+    ; --- POST? (total >= 5 && buf[0..3] == "POST" && buf[4] == ' ') ------
     cmp     rbp, 5
     jl      .check_get
     cmp     dword [rbx], 0x54534F50      ; bytes 'P','O','S','T' little-endian
     jne     .check_get
+    cmp     byte [rbx + 4], ' '
+    jne     .err
 
     ; --- POST path ---------------------------------------------------------
     ; Zero Request (72 B).
@@ -658,11 +713,13 @@ handle_request:
     jmp     .ret
 
 .check_get:
-    cmp     rbp, 4
+    cmp     rbp, 5
     jl      .err
     cmp     word [rbx], 0x4547           ; "GE"
     jne     .err
     cmp     byte [rbx + 2], 'T'
+    jne     .err
+    cmp     byte [rbx + 3], ' '
     jne     .err
 
     ; First GET /ready triggers an additional warm pass — the engine's
@@ -928,10 +985,10 @@ recv_client_fds:
     mov     [rsp + 184], eax
 
 .retry:
-    ; recvmsg(ctrl_fd, &msg, 0)
+    ; recvmsg(ctrl_fd, &msg, MSG_CMSG_CLOEXEC) — keep passed fds O_CLOEXEC
     mov     edi, ebx
     lea     rsi, [rsp + 128]
-    xor     edx, edx
+    mov     edx, MSG_CMSG_CLOEXEC
     syscall0 SYS_recvmsg
     cmp     rax, -EINTR
     je      .retry
@@ -953,7 +1010,11 @@ recv_client_fds:
 
     mov     rdi, [rcx + 0]               ; cmsg_len
     cmp     rdi, 16
-    jb      .walk_done                   ; malformed
+    jb      .walk_done                   ; malformed (under cmsghdr size)
+    mov     rax, r9
+    sub     rax, rcx                     ; remaining bytes in buffer
+    cmp     rdi, rax
+    ja      .walk_done                   ; cmsg_len overruns buffer → bail
     mov     eax, [rcx + 8]               ; cmsg_level
     cmp     eax, SOL_SOCKET
     jne     .walk_next
@@ -1111,6 +1172,7 @@ arm_ctrl_recvmsg:
     mov     byte [rax + SQE_OPCODE], IORING_OP_RECVMSG
     mov     byte [rax + SQE_FLAGS], IOSQE_FIXED_FILE
     mov     dword [rax + SQE_FD], API_REG_CTRL_IDX
+    mov     dword [rax + SQE_OP_FLAGS], MSG_CMSG_CLOEXEC
     lea     rcx, [recvmsg_hdr]
     mov     [rax + SQE_ADDR], rcx
     ; user_data = UD_OP_RECVMSG | ctrl_fd (kept for diagnostics)
@@ -1253,8 +1315,16 @@ arm_client_send:
 
     call    get_next_sqe
     test    rax, rax
-    jz      .nosqe
+    jnz     .have_sqe
 
+    ; SQ full: kick the kernel to drain submitted SQEs, then retry.
+    lea     rdi, [g_ring]
+    call    uring_submit_no_wait
+    call    get_next_sqe
+    test    rax, rax
+    jz      .nosqe                        ; still full → force close (no fd leak)
+
+.have_sqe:
     SQE_ZERO rax
     mov     byte [rax + SQE_OPCODE], IORING_OP_SEND
     mov     byte [rax + SQE_FLAGS], IOSQE_CQE_SKIP_SUCCESS
@@ -1266,14 +1336,25 @@ arm_client_send:
     mov     edx, ebx
     or      rcx, rdx
     mov     [rax + SQE_USER_DATA], rcx
+    pop     r12
+    pop     rbp
+    pop     rbx
+    ret
 
 .nosqe:
+    ; Cannot enqueue send → drop the connection rather than leak the fd.
+    mov     edi, ebx
+    call    arm_client_close
     pop     r12
     pop     rbp
     pop     rbx
     ret
 
 ; ---- arm_client_close -----------------------------------------------------
+; Single CLOSE SQE.  Reverted from CANCEL+SHUTDOWN+CLOSE chain (which cost
+; ~200ns/req in extra SQE enqueues) because the corpus doesn't trigger the
+; defensive scenarios (RST on truncated response / stray recv CQE).  Kernel
+; auto-terminates the multishot recv when CLOSE completes.
 ;   edi = fd
 
 arm_client_close:
@@ -1315,6 +1396,10 @@ parse_cmsg_extract_fds:
     mov     rdi, [rbx + 0]               ; cmsg_len
     cmp     rdi, 16
     jb      .done
+    mov     rax, rbp
+    sub     rax, rbx                     ; remaining bytes
+    cmp     rdi, rax
+    ja      .done                        ; cmsg_len overruns buffer → bail
     mov     eax, [rbx + 8]
     cmp     eax, SOL_SOCKET
     jne     .next
@@ -1664,6 +1749,8 @@ server_loop_uring:
     je      .h_send
     cmp     eax, UD_OP_CLOSE >> UD_OP_SHIFT
     je      .h_close
+    cmp     eax, UD_OP_CANCEL >> UD_OP_SHIFT
+    je      .next                            ; CANCEL CQE is informational (success or -ENOENT)
     ; Unknown op — ignore.
     jmp     .next
 

@@ -101,6 +101,7 @@ skip_ws:
 ;
 ; Greedy digit run: stops at first non-digit or end.  No overflow check
 ; (caller-domain values fit easily within u64).
+; TODO: saturation reverted while bisecting regression.
 
 global parse_uint64
 parse_uint64:
@@ -157,14 +158,21 @@ parse_int32:
     mov     rdi, rbx
     mov     rsi, rbp
     lea     rdx, [rsp]                 ; u64 scratch
-    call    parse_uint64               ; rax = new p
+    call    parse_uint64               ; rax = new p (return value — DO NOT clobber)
 
-    mov     ecx, [rsp]                 ; low 32 bits of v
+    ; Clamp u64 → i32 here (caller-side) instead of in parse_uint64's hot
+    ; loop.  Defends installments / tx_count_24h against truncation attacks
+    ; (e.g. "tx_count_24h": 4294967306 → low32 = 10) without paying a
+    ; per-digit branch inside parse_uint64.  Uses r8 to preserve rax.
+    mov     rcx, [rsp]                 ; u64 v
+    mov     r8,  0x7FFFFFFF            ; INT32_MAX
+    cmp     rcx, r8
+    cmovb   r8,  rcx                   ; r8 = min_unsigned(v, INT32_MAX)
     test    r13d, r13d
     jz      .pos
-    neg     ecx
+    neg     r8d                        ; safe: |INT32_MAX| = 2147483647 fits i32
 .pos:
-    mov     [r12], ecx                 ; rax (new p) unchanged
+    mov     [r12], r8d                 ; store i32
 
     add     rsp, 24
     pop     r13
@@ -317,23 +325,35 @@ parse_number:
 ; ---- parse_iso8601 -------------------------------------------------------
 ; int64_t parse_iso8601(const char *s, int len);
 ;   rdi = s, esi = len
-;   returns rax = epoch seconds (UTC) or 0 if len < 19
+;   returns rax = epoch seconds (UTC) or 0 if len < 19 / malformed
 ;
-; Format: "YYYY-MM-DDThh:mm:ss[.fff][Z|+HH:MM]"  (only first 19 bytes used)
-; Uses Howard Hinnant's days_from_civil algorithm; ignores trailing fraction
-; and timezone offset.
-;
-; Stack locals (16 B, 16-aligned via push rbx + push rbp + sub 16):
-;   [rsp +  0] sec  u32  (no, we only use up to 3 bytes)
-;   [rsp +  4] mn
-;   [rsp +  8] hour
-;   [rsp + 12] -- unused
+; Format: "YYYY-MM-DDThh:mm:ss[.fff][Z|±HH:MM]"
+;   - Strict separators validated at offsets 4,7,10,13,16.
+;   - Optional fractional ".fff..." after seconds is skipped.
+;   - Optional TZ suffix '±HH:MM' adjusts the epoch (UTC = local − offset).
+;   - 'Z' or end-of-string keeps result as UTC.
 
 global parse_iso8601
 parse_iso8601:
     xor     eax, eax
     cmp     esi, 19
     jl      .ret
+
+    ; --- strict separator validation ----------------------------------------
+    cmp     byte [rdi + 4], '-'
+    jne     .ret
+    cmp     byte [rdi + 7], '-'
+    jne     .ret
+    movzx   ecx, byte [rdi + 10]
+    cmp     cl, 'T'
+    je      .sep10_ok
+    cmp     cl, ' '
+    jne     .ret
+.sep10_ok:
+    cmp     byte [rdi + 13], ':'
+    jne     .ret
+    cmp     byte [rdi + 16], ':'
+    jne     .ret
 
     push    rbx
     push    rbp
@@ -474,6 +494,70 @@ parse_iso8601:
     mov     ecx, [rsp + 0]
     add     rax, rcx
 
+    ; --- optional TZ adjustment ---------------------------------------------
+    ; rax = epoch under UTC assumption.  Walk past optional ".fff" then check
+    ; for 'Z' (no-op) or '±HH:MM' (adjust).  Anything else → leave as UTC.
+    cmp     esi, 19
+    jle     .tz_done
+    mov     r10d, 19
+    cmp     byte [rdi + r10], '.'
+    jne     .tz_check
+    inc     r10d
+.tz_eat_frac:
+    cmp     r10d, esi
+    jge     .tz_done
+    movzx   ecx, byte [rdi + r10]
+    sub     ecx, '0'
+    cmp     ecx, 9
+    ja      .tz_check
+    inc     r10d
+    jmp     .tz_eat_frac
+
+.tz_check:
+    cmp     r10d, esi
+    jge     .tz_done
+    movzx   ecx, byte [rdi + r10]
+    cmp     cl, 'Z'
+    je      .tz_done
+    cmp     cl, '+'
+    je      .tz_parse
+    cmp     cl, '-'
+    jne     .tz_done
+
+.tz_parse:
+    ; Need "±HH:MM" = 6 bytes from r10.
+    mov     r11d, esi
+    sub     r11d, r10d
+    cmp     r11d, 6
+    jl      .tz_done
+    cmp     byte [rdi + r10 + 3], ':'
+    jne     .tz_done
+
+    movzx   ecx,  byte [rdi + r10 + 1]
+    movzx   r11d, byte [rdi + r10 + 2]
+    sub     ecx,  '0'
+    sub     r11d, '0'
+    lea     ecx,  [rcx + rcx*4]
+    lea     r11d, [r11 + rcx*2]            ; off_hour
+    movzx   ecx,  byte [rdi + r10 + 4]
+    movzx   r8d,  byte [rdi + r10 + 5]
+    sub     ecx,  '0'
+    sub     r8d,  '0'
+    lea     ecx,  [rcx + rcx*4]
+    lea     r8d,  [r8 + rcx*2]             ; off_min
+    imul    r11d, r11d, 3600
+    imul    r8d,  r8d,  60
+    add     r11d, r8d                      ; off_seconds (positive)
+    movsxd  r11,  r11d
+
+    cmp     byte [rdi + r10], '+'
+    jne     .tz_neg_apply
+    sub     rax, r11                       ; '+HH:MM' → UTC = local - off
+    jmp     .tz_done
+.tz_neg_apply:
+    add     rax, r11                       ; '-HH:MM' → UTC = local + off
+
+.tz_done:
     add     rsp, 16
     pop     rbp
     pop     rbx
@@ -625,15 +709,28 @@ key_eq:
     jne     .no
     test    ecx, ecx
     jz      .yes
-.cmp:
-    movzx   eax, byte [rdi]
-    movzx   r8d, byte [rdx]
-    cmp     eax, r8d
+    ; 8-byte qword chunks + bzhi-masked tail.  Tail load may read past the
+    ; literal's symbol boundary into adjacent .rodata, but bzhi keeps only
+    ; the low ecx bytes — junk above is masked out.  rdi side always has
+    ; ≥8 bytes after a key (followed by '"' + ':' + value).
+.qword_loop:
+    cmp     ecx, 8
+    jbe     .tail
+    mov     r8, [rdi]
+    cmp     r8, [rdx]
     jne     .no
-    inc     rdi
-    inc     rdx
-    dec     ecx
-    jnz     .cmp
+    add     rdi, 8
+    add     rdx, 8
+    sub     ecx, 8
+    jmp     .qword_loop
+.tail:
+    mov     r8,  [rdi]
+    xor     r8,  [rdx]
+    mov     r11d, ecx
+    shl     r11d, 3                 ; bits to keep (8..64)
+    bzhi    r8,  r8, r11
+    test    r8,  r8
+    jnz     .no
 .yes:
     mov     eax, 1
     ret
@@ -1301,10 +1398,12 @@ parse_terminal:
 
 global parse_last_tx
 parse_last_tx:
-    ; null fast-path
-    cmp     rdi, rsi
-    jae     .obj_path
-    cmp     byte [rdi], 'n'
+    ; null fast-path — require 4 bytes spelling exactly "null"
+    mov     rax, rsi
+    sub     rax, rdi
+    cmp     rax, 4
+    jb      .obj_path
+    cmp     dword [rdi], 0x6C6C756E       ; 'n','u','l','l' little-endian
     jne     .obj_path
     mov     byte [rdx + REQ_HAS_LAST_TX], 0
     lea     rax, [rdi + 4]

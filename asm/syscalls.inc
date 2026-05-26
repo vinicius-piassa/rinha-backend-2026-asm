@@ -152,6 +152,7 @@
 %define MSG_NOSIGNAL          0x4000
 %define MSG_PEEK              0x0002
 %define MSG_DONTWAIT          0x0040
+%define MSG_CMSG_CLOEXEC      0x40000000
 %define SCM_RIGHTS            1
 
 %define EPOLLIN               0x001

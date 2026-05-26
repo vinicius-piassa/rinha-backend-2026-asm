@@ -95,6 +95,7 @@ vectorize:
     ; v[2] = customer_avg > 0 ? clamp01((amount / customer_avg) / 10) : 0
     xorpd   xmm0, xmm0
     ucomisd xmm0, [rbx + REQ_CUSTOMER_AVG]
+    jp      .v2_zero                     ; NaN customer_avg → store 0 (defensive)
     jae     .v2_zero                     ; if 0 >= customer_avg, store 0
     movsd   xmm0, [rbx + REQ_AMOUNT]
     divsd   xmm0, [rbx + REQ_CUSTOMER_AVG]
