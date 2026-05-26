@@ -1374,6 +1374,115 @@ arm_client_close:
     pop     rbx
     ret
 
+; ---- try_inline_request --------------------------------------------------
+; Greedy sync recv path for the first request on a newly-accepted client.
+; Because the LB sets TCP_DEFER_ACCEPT, the kernel only delivers the fd
+; after the first POST byte is buffered.  Doing a recv(MSG_DONTWAIT) here
+; usually returns the full request immediately, letting us run the entire
+; drain pipeline (http_frame → handle_request → arm_client_send) inline
+; and skip one io_uring CQE round-trip (~10-30µs on this judge hardware).
+;
+; If recv yields EAGAIN, a partial frame, or any error, we fall through
+; without queueing any SEND — the multishot recv armed by the caller will
+; deliver whatever bytes follow.  conn_state[fd].buf_pos is set to:
+;   0          → all bytes consumed (multishot reads kernel buffers)
+;   leftover   → partial frame stashed in conn_state buf (multishot will
+;                accumulate from there)
+;
+;   edi = fd
+;   rsi = &conn_state[fd]   (STATE_BUF starts at offset 0)
+
+try_inline_request:
+    push    rbx                          ; fd
+    push    rbp                          ; conn_state buf ptr
+    push    r14                          ; work_buf (moves as drain advances)
+    sub     rsp, 24                       ; locals (mirrors handle_recv_cqe):
+                                          ;   [+0]  body_off
+                                          ;   [+4]  body_len
+                                          ;   [+8]  total
+                                          ;   [+12] out_len
+                                          ;   [+16] work_len
+
+    mov     ebx, edi
+    mov     rbp, rsi
+
+    ; recv(fd, buf, BUF_SIZE, MSG_DONTWAIT, NULL, NULL)
+    mov     edi, ebx
+    mov     rsi, rbp
+    mov     edx, BUF_SIZE
+    mov     r10d, MSG_DONTWAIT
+    xor     r8, r8
+    xor     r9, r9
+    syscall0 SYS_recvfrom
+    test    rax, rax
+    jle     .done                        ; <=0: EAGAIN/EOF/error → bail to multishot
+
+    mov     [rsp + 16], eax              ; work_len = n
+    mov     r14, rbp                     ; work_buf = conn_state buf
+
+.drain:
+    mov     edx, [rsp + 16]
+    test    edx, edx
+    jz      .all_consumed
+
+    mov     rdi, r14
+    mov     esi, edx
+    lea     rdx, [rsp + 0]
+    lea     rcx, [rsp + 4]
+    call    http_frame
+    test    eax, eax
+    jz      .partial
+
+    mov     [rsp + 8], eax
+
+    mov     rdi, r14
+    mov     esi, eax
+    mov     edx, [rsp + 0]
+    mov     ecx, [rsp + 4]
+    lea     r8,  [rsp + 12]
+    call    handle_request
+
+    mov     edi, ebx
+    mov     rsi, rax
+    mov     edx, [rsp + 12]
+    call    arm_client_send
+
+    movsxd  rax, dword [rsp + 8]
+    add     r14, rax
+    mov     ecx, [rsp + 16]
+    sub     ecx, eax
+    mov     [rsp + 16], ecx
+    jmp     .drain
+
+.all_consumed:
+    mov     dword [rbp + STATE_BUF_POS], 0
+    jmp     .done
+
+.partial:
+    ; Partial frame in work_buf.  If work_buf advanced past rbp, memmove
+    ; the leftover back to rbp before recording buf_pos.
+    mov     ecx, [rsp + 16]
+    cmp     r14, rbp
+    je      .partial_inplace
+    cmp     ecx, BUF_SIZE
+    jae     .done                        ; oversized — drop, caller arms recv anyway
+    push    rcx
+    mov     rdi, rbp
+    mov     rsi, r14
+    movsxd  rcx, ecx
+    cld
+    rep     movsb
+    pop     rcx
+.partial_inplace:
+    mov     [rbp + STATE_BUF_POS], ecx
+
+.done:
+    add     rsp, 24
+    pop     r14
+    pop     rbp
+    pop     rbx
+    ret
+
 ; ---- parse_cmsg_extract_fds -----------------------------------------------
 ; Walks one SCM_RIGHTS-bearing msg_control buffer and registers every fd
 ; with the io_uring loop (zero its conn_state buf_pos + submit recv).
@@ -1427,6 +1536,33 @@ parse_cmsg_extract_fds:
     push    rcx
     push    r10
     push    r11
+
+    ; TCP_QUICKACK on the newly received client fd.  The LB's earlier
+    ; setsockopt was effectively a no-op (LB never recv()s, the option
+    ; is one-shot until the next ACK).  Setting it here on the receiver
+    ; side makes the first response to k6 skip the delayed-ACK window.
+    ; Synchronous syscall — ~200ns one-time cost per accepted connection.
+    push    rdi                          ; save fd across syscall
+    sub     rsp, 8                       ; optval int (4) + align
+    mov     dword [rsp], 1
+    mov     esi, SOL_TCP
+    mov     edx, TCP_QUICKACK
+    lea     r10, [rsp]
+    mov     r8d, 4
+    syscall0 SYS_setsockopt
+    add     rsp, 8
+    pop     rdi                          ; restore fd
+
+    ; Greedy sync recv — skip the io_uring round-trip for the first POST.
+    ; TCP_DEFER_ACCEPT guarantees data is already buffered.
+    push    rdi                          ; save fd
+    movsxd  rsi, edi
+    imul    rsi, rsi, STATE_SIZE
+    lea     rax, [conn_state]
+    add     rsi, rax                     ; rsi = &conn_state[fd]
+    call    try_inline_request
+    pop     rdi                          ; restore fd
+
     call    arm_client_recv
     pop     r11
     pop     r10
@@ -2068,8 +2204,8 @@ _start:
 
     ; Kernel busy-poll NAPI on the ring — 50 µs budget, best-effort.  Cuts
     ; the NIC → user wake-up latency for short windows where recv lands
-    ; right after a previous CQE was reaped.  Silently ignored on kernels
-    ; older than 6.9 (no IORING_REGISTER_NAPI opcode).
+    ; right after a previous CQE was reaped.  100µs was tried and regressed
+    ; (over-polled, ate CPU budget).  Silently ignored on kernels &lt; 6.9.
     lea     rdi, [g_ring]
     mov     esi, 50
     call    uring_register_napi
