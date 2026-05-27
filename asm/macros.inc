@@ -70,7 +70,7 @@
 ; → -11pts.  Hypothesis: at NPROBE=12 the repair pattern triggers more
 ; often (more ambiguous initial top-5), causing the full-sweep extension
 ; to dominate cost.  16 is the sweet spot.
-%define NPROBE_INITIAL     16
+%define NPROBE_INITIAL     12
 %define NPROBE_REPAIR_MIN  1
 %define NPROBE_REPAIR_MAX  4
 %define SCALE         10000
