@@ -245,11 +245,11 @@ parse_number:
     cmp     r15, 20
     jae     .check_exp                 ; bail: C drops len >= 20
 
-    cvtsi2sd xmm0, qword [rsp + 8]
-    lea     rax, [pow10_neg]
-    mulsd   xmm0, [rax + r15*8]
-    addsd   xmm0, [rsp + 24]
-    movsd   [rsp + 24], xmm0
+    cvtsi2sd     xmm0, qword [rsp + 8]
+    lea          rax, [pow10_neg]
+    movsd        xmm1, [rax + r15*8]          ; pow10_neg[len] → mul operand reg
+    vfmadd213sd  xmm0, xmm1, [rsp + 24]       ; xmm0 = xmm0 * xmm1 + int_part
+    movsd        [rsp + 24], xmm0
 
 .check_exp:
     cmp     rbx, rbp

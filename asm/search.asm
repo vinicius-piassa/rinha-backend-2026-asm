@@ -93,7 +93,11 @@ compute_cluster_packed:
     cmp          eax, ecx
     jae          .done
 
-    vpxor        ymm10, ymm10, ymm10         ; acc i32 × 8 (one per cluster lane)
+    ; Dual-chain accumulators (same pattern as scan_cluster's sA/sB).  Halves
+    ; the serial vpaddd dep chain: 7 pairs split across A={0,2,4,6} (4) and
+    ; B={1,3,5} (3) → critical path = 4 vpaddd + 1 fuse = 5, down from 7.
+    vpxor        ymm10, ymm10, ymm10         ; chain A (pairs 0,2,4,6)
+    vpxor        ymm15, ymm15, ymm15         ; chain B (pairs 1,3,5)
 
     ; Per pair p in 0..6, compute pair_sq across 8 clusters and accumulate.
     ; i32 accumulator is safe: bound per pair = 2·(2·SCALE)² = 8·10⁸; sum of 7
@@ -105,7 +109,7 @@ compute_cluster_packed:
     ; regression, validating this empirically.  Overflow only causes the
     ; cluster's lb to wrap (likely staying large unsigned) → at worst a
     ; few wasted scans on already-pruneable clusters, never a wrong top-K.
-%macro PAIR_ACC 1
+%macro PAIR_ACC 2   ; %1 = pair index, %2 = accumulator ymm number
     vmovdqu      ymm12, [rsi + r9 + %1*32]   ; bmin pair (linearized address)
     vmovdqu      ymm13, [rdx + r9 + %1*32]   ; bmax pair
     vpsubw       ymm12, ymm12, ymm%1
@@ -114,16 +118,17 @@ compute_cluster_packed:
     vpmaxsw      ymm13, ymm13, ymm14
     vpmaxsw      ymm12, ymm12, ymm13
     vpmaddwd     ymm12, ymm12, ymm12         ; 8 i32: per-cluster pair-sq
-    vpaddd       ymm10, ymm10, ymm12         ; i32 accumulate
+    vpaddd       ymm%2, ymm%2, ymm12         ; i32 accumulate into chain
 %endmacro
-    PAIR_ACC 0
-    PAIR_ACC 1
-    PAIR_ACC 2
-    PAIR_ACC 3
-    PAIR_ACC 4
-    PAIR_ACC 5
-    PAIR_ACC 6
-%unmacro PAIR_ACC 1
+    PAIR_ACC 0, 10
+    PAIR_ACC 1, 15
+    PAIR_ACC 2, 10
+    PAIR_ACC 3, 15
+    PAIR_ACC 4, 10
+    PAIR_ACC 5, 15
+    PAIR_ACC 6, 10
+%unmacro PAIR_ACC 2
+    vpaddd       ymm10, ymm10, ymm15         ; fuse chain B into A
 
     ; Widen 8 i32 → 8 i64, split into ymm10 (low 4) and ymm11 (high 4)
     vextracti128 xmm12, ymm10, 1

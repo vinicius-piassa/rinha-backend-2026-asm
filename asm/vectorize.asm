@@ -56,16 +56,17 @@ section .text
 
 ; ---- CLAMP01_I16 ----------------------------------------------------------
 ; In:  xmm0 = double x
+;      xmm14 = c_scale (10000.0), xmm15 = c_half (0.5)  — preloaded once
+;             at vectorize entry so the macro is just maxsd/minsd/FMA/cvt.
 ; Out: eax  = trunc(clamp(x,0,1) * 10000 + 0.5)   (i.e. round-half-up to i16)
 ; Clobbers xmm0, xmm1.
 %macro CLAMP01_I16 0
-    xorpd   xmm1, xmm1
-    maxsd   xmm0, xmm1
-    movsd   xmm1, [c_one]
-    minsd   xmm0, xmm1
-    mulsd   xmm0, [c_scale]
-    addsd   xmm0, [c_half]
-    cvttsd2si eax, xmm0
+    xorpd       xmm1, xmm1
+    maxsd       xmm0, xmm1
+    movsd       xmm1, [c_one]
+    minsd       xmm0, xmm1
+    vfmadd213sd xmm0, xmm14, xmm15        ; xmm0 = xmm0 * scale + half  (FMA3)
+    cvttsd2si   eax, xmm0
 %endmacro
 
 global vectorize
@@ -78,6 +79,14 @@ vectorize:
 
     mov     rbx, rdi                     ; rbx = Request*
     mov     r12, rsi                     ; r12 = Query*
+
+    ; Preload CLAMP01_I16 constants into xmm14/xmm15 so the macro fuses
+    ; the post-clamp scale+round into a single FMA3 instruction per call.
+    ; Saves ~3 cy in the dependency chain (mulsd:5 + addsd:3 → vfmadd:5)
+    ; plus 2 memory loads per invocation × 14 invocations = 28 fewer L1d
+    ; hits per vectorize.  xmm14/15 are unused elsewhere in this function.
+    movsd   xmm14, [c_scale]
+    movsd   xmm15, [c_half]
 
     ; v[0] = clamp01(amount / 10000)
     movsd   xmm0, [rbx + REQ_AMOUNT]
