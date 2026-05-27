@@ -601,7 +601,12 @@ search_core:
     jmp     .probe
 
 .done:
-    ; ---- Repair pattern --------------------------------------
+    ; ---- Repair pattern --------------------------------------------------
+    ; Originally explored before we had FMA3 / dual-chain, then shelved
+    ; because the unambiguous early-exit was firing on borderline samples
+    ; and FP/FN rose.  Re-enabled after the per-pair compute got fast
+    ; enough that the initial NPROBE budget reaches well-separated top-5s.
+    ;
     ; The initial probe budget is small (NPROBE_INITIAL = 12).  When that
     ; finishes, the top-5 label sum is either unambiguous (0 = all legit,
     ; 5 = all fraud) or ambiguous ([1, 4]).  Unambiguous → return; the
