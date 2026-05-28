@@ -81,6 +81,19 @@ compute_cluster_packed:
     vmovdqa      ymm6, [rdi + 6*32]
     vpxor        ymm14, ymm14, ymm14         ; zero (for vpmaxsw)
 
+    ; Hoist per-group index broadcast: maintain running cluster-index vectors
+    ; instead of recomputing base = g*8 + broadcast on every iteration.
+    ;   ymm8 = [g*8+0, g*8+1, g*8+2, g*8+3]
+    ;   ymm9 = [g*8+4, g*8+5, g*8+6, g*8+7]
+    ;   ymm7 = [8, 8, 8, 8]   ; step delta
+    ; This eliminates per-group `mov r10d,eax; shl; vmovq; vpbroadcastq`
+    ; (~3-cy port-5 chain) AND two L1d loads of c_idx_off_lo/hi.
+    vmovdqa      ymm8, [c_idx_off_lo]        ; initial low  = [0,1,2,3]
+    vmovdqa      ymm9, [c_idx_off_hi]        ; initial high = [4,5,6,7]
+    mov          r10d, 8
+    vmovq        xmm7, r10
+    vpbroadcastq ymm7, xmm7                  ; ymm7 = [8,8,8,8]
+
     ; n_groups = (ecx + 7) >> 3
     add          ecx, 7
     shr          ecx, 3
@@ -139,19 +152,19 @@ compute_cluster_packed:
     vpsllq       ymm10, ymm10, CID_BITS
     vpsllq       ymm11, ymm11, CID_BITS
 
-    ; base = g * 8 broadcast as 4 i64; lo lanes get +[0,1,2,3], hi get +[4,5,6,7]
-    mov          r10d, eax
-    shl          r10d, 3                     ; r10d = base = g * 8
-    vmovq        xmm12, r10
-    vpbroadcastq ymm12, xmm12
-    vpaddq       ymm10, ymm10, ymm12
-    vpaddq       ymm10, ymm10, [c_idx_off_lo]
-    vpaddq       ymm11, ymm11, ymm12
-    vpaddq       ymm11, ymm11, [c_idx_off_hi]
+    ; Fold running cluster-index vectors (ymm8 = low [0..3]+base, ymm9 = high
+    ; [4..7]+base) directly — no broadcast, no L1d.
+    vpaddq       ymm10, ymm10, ymm8
+    vpaddq       ymm11, ymm11, ymm9
 
     ; Store 8 i64 to out[g*8 .. g*8+7] using linearized r11 = g*64
     vmovdqu      [r8 + r11], ymm10
     vmovdqu      [r8 + r11 + 32], ymm11
+
+    ; Advance running indices by 8 for next group.  These are off the
+    ; critical path (post-store) so they overlap with the loop overhead.
+    vpaddq       ymm8, ymm8, ymm7
+    vpaddq       ymm9, ymm9, ymm7
 
     add          r9, 224                     ; next group's bpsoa base (7 × 32)
     add          r11, 64                     ; next group's out base
@@ -655,26 +668,27 @@ search_core:
 ;     rdi = ix, rsi = q
 ;     ret = sum of top-5 labels (fraud count, 0..5)
 
+; INT16 baseline search wrapper.
+; Calls search_core with NPROBE_INITIAL, then popcounts the 5-byte topk_l
+; label slot to produce fraud count ∈ [0, 5].
+
 global search
 search:
-    sub     rsp, 56                         ; topk_k(40)+topk_l(5)+pad — keeps rsp aligned
-    ; layout: [rsp + 0..39] topk_k, [rsp + 40..44] topk_l
+    sub     rsp, 56                         ; topk_k(40)+topk_l(5)+pad
 
-    mov     edx, NPROBE_INITIAL             ; initial probe budget; search_core
-                                            ; extends to N_CLUSTERS only if
-                                            ; the resulting top-5 is ambiguous
-    xor     ecx, ecx                        ; trace = NULL
+    mov     edx, NPROBE_INITIAL
+    xor     ecx, ecx
     lea     r8, [rsp]
     lea     r9, [rsp + 40]
     call    search_core
 
-    ; Sum 5 label bytes via popcnt — each byte is 0 or 1.  The 56-byte stack
-    ; allocation has 11 bytes of slack past topk_l, so reading 8 bytes from
-    ; [rsp+40] is safe.
-    mov     rax, [rsp + 40]                 ; 8 bytes (last 3 garbage)
-    mov     rcx, 0xFFFFFFFFFF               ; mask first 5 bytes
+    ; Sum 5 label bytes via popcnt — each byte is 0 or 1.  The 56-byte
+    ; stack allocation has 11 bytes of slack past topk_l, so reading 8
+    ; bytes from [rsp + 40] is safe.
+    mov     rax, [rsp + 40]
+    mov     rcx, 0xFFFFFFFFFF
     and     rax, rcx
-    popcnt  rax, rax                        ; rax ∈ [0,5]
+    popcnt  rax, rax
 
     add     rsp, 56
     ret

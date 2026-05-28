@@ -50,6 +50,34 @@ c_scale_f32_vec:                     ; SCALE = 10000.0f broadcast across 8 lanes
     dd 0x461C4000, 0x461C4000, 0x461C4000, 0x461C4000
     dd 0x461C4000, 0x461C4000, 0x461C4000, 0x461C4000
 
+; --- INT8 percentile-quantization constants ---
+align 4
+c_one_s_bi:     dd 0x3F800000        ; 1.0 f32
+c_4096_s_bi:    dd 0x45800000        ; 4096.0 f32
+c_neg_half_s:   dd 0xBF000000        ; -0.5 f32  (sentinel boundary)
+c_upper_s:      dd 0x40000000        ; 2.0 f32   (last bucket catch-all)
+c_inv_4096_s:   dd 0x39800000        ; 1.0/4096 f32 (≈ 2.44e-4)
+c_inv_128_s:    dd 0x3C000000        ; 1.0/128 f32  (= 0.0078125)
+c_inv_256_s:    dd 0x3B800000        ; 1.0/256 f32  (= 0.00390625)
+c_inv_254_s:    dd 0x3B816A41        ; 1.0/254 f32  (≈ 0.003937, sentinel dims use 254 buckets)
+c_minus_half_s: dd 0xBF000000        ; -0.5 f32  (sentinel bucket boundary)
+
+; Per-dim observed [min, max] from references.json analysis (3M refs).  For
+; sentinel dims (5, 6), min/max here are NON-SENTINEL bounds; bucket 0 of
+; the threshold table is reserved separately for sentinel values.
+align 16
+c_dim_min:
+    dd  0.001,  0.0833, 0.05,   0.0,   0.0,    0.0,    0.0,   0.0
+    dd  0.05,   0.0,    0.0,    0.0,   0.15,   0.002,  0.0,   0.0  ; tail 2 = pad
+align 16
+c_dim_max:
+    dd  1.0,    1.0,    1.0,    0.9565, 1.0,    0.4993, 1.0,   1.0
+    dd  1.0,    1.0,    1.0,    1.0,    0.85,   0.05,   0.0,   0.0  ; tail 2 = pad
+; Sentinel-aware flag per dim: 1 if -1 sentinel possible (dims 5, 6), else 0.
+c_dim_sent:
+    db  0, 0, 0, 0, 0, 1, 1, 0
+    db  0, 0, 0, 0, 0, 0
+
 err_open_in_msg:    db "build_index: failed to open input", 10
 err_open_in_len  equ $ - err_open_in_msg
 err_open_out_msg:   db "build_index: failed to open output", 10
@@ -916,12 +944,21 @@ write_padded:
 ;     int16_t **pair_arr,           // arg6
 ;     const uint8_t *labels);       // arg7
 ; Returns 0 on success, -1 on any write error.
+;
+; File layout (all sections 64-byte padded):
+;     header (64)
+;     cluster_offsets ((K+1) * 4)
+;     bbox_min (K * 32)
+;     bbox_max (K * 32)
+;     pair_arr[0..6]  (each n * 4)
+;     labels (n)
+;     tail pad (64)
 
 global write_index_bin
 write_index_bin:
-    ; Snapshot stack arg (arg7 = labels) BEFORE the prologue while it sits
-    ; at [rsp + 8].  r10 is caller-saved and not used by SysV for the first
-    ; six args, so we can park the value there until we have a local slot.
+    ; Snapshot stack arg7 (labels) BEFORE the prologue while it sits at
+    ; [rsp+8].  r10 is caller-saved and unused by SysV for the first six
+    ; args, so we park labels there until we have a local slot.
     mov     r10, [rsp + 8]                ; labels (arg7)
 
     push    rbx                          ; fd
@@ -938,7 +975,7 @@ write_index_bin:
     mov     r13, rcx
     mov     r14, r8
     mov     r15, r9
-    mov     [rsp + 64], r10               ; labels in local slot
+    mov     [rsp + 64], r10               ; labels
 
     ; --- Header (64 B): magic + n_clusters + n_vectors + zero tail ----
     pxor    xmm0, xmm0
@@ -1245,7 +1282,6 @@ _start:
     ;     [rsp + 88]  labels_out
     ;     [rsp + 96..151]  7 pair_arr ptrs (56 B)
     ;     [rsp + 152]  out_fd (i32 + pad)
-    ;     [rsp + 160]  pair_arr_ptrs slot (single pointer = rsp+96)
 
     sub     rsp, 192
     mov     [rsp + 0], rax
@@ -1266,12 +1302,13 @@ _start:
     call    parse_refs
     test    rax, rax
     js      .err_parse
+    mov     [rsp + 24], rax              ; stash full n
 
     ; Filter refs in place by partition tag (in r12d).  Refs not matching
     ; the tag are discarded; remaining ones compacted into the front of the
     ; buffer.  Returns new n_refs ≤ original.
     mov     rdi, [rsp + 16]
-    mov     rsi, rax
+    mov     esi, [rsp + 24]              ; full n (pre-filter)
     mov     edx, r12d
     call    filter_refs_by_tag
     mov     [rsp + 24], rax              ; n_refs (post-filter)
@@ -1314,7 +1351,7 @@ _start:
     call    mmap_alloc
     mov     [rsp + 88], rax
 
-    ; 7 pair arrays at [rsp + 96 + p*8]
+    ; 7 pair arrays at [rsp + 96 + p*8]  (i16 pairs, n × 4 bytes each)
 %assign P 0
 %rep N_PAIRS
     mov     rdi, [rsp + 24]
@@ -1370,9 +1407,11 @@ _start:
     mov     rcx, [rsp + 72]
     mov     r8,  [rsp + 80]
     lea     r9,  [rsp + 96]
-    push    qword [rsp + 88]              ; arg7: labels
+    mov     rax, [rsp + 88]               ; labels
+    sub     rsp, 8                        ; align before single-arg push
+    push    rax                           ; arg7: labels
     call    write_index_bin
-    add     rsp, 8
+    add     rsp, 16
 
     ; --- close output ----
     mov     edi, [rsp + 152]

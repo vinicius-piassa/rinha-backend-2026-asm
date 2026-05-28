@@ -71,9 +71,11 @@ mcc_risk_i16:
     shr          eax, 1              ; byte-pos → u16 index
     lea          rcx, [override_vals]
     movsx        eax, word [rcx + rax*2]
+    vzeroupper                       ; clear ymm INIT bit before returning
     ret
 .default:
     mov          eax, 5000
+    vzeroupper                       ; clear ymm INIT bit before returning
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -15,7 +15,6 @@ default rel
 
 %include "syscalls.inc"
 %include "macros.inc"
-%include "uring.inc"
 
 extern parse_request
 
@@ -23,18 +22,12 @@ extern vectorize
 extern search
 extern mcc_init
 extern index_open
-extern uring_init
-extern uring_submit_and_wait
-extern uring_submit_no_wait
-extern uring_register_files
-extern uring_register_napi
-extern uring_register_pbuf_ring
 
 %define BUF_SIZE         4096
 %define MAX_FDS          1024
 %define STATE_SIZE       4104          ; buf(4096) + buf_pos(4) + 4 pad
 %define STATE_BUF_POS    4096
-%define MAX_EVENTS       64
+%define MAX_EVENTS       128
 %define EPOLL_EV_SIZE    12            ; struct epoll_event is __packed
 %define EPOLL_EV_FD      4             ; data.fd at offset 4
 
@@ -52,7 +45,7 @@ extern uring_register_pbuf_ring
 %define IX_LABELS            112
 %define IX_BPSOA_MIN         120
 %define IX_BPSOA_MAX         128
-%define IX_SIZE              136
+%define IX_SIZE              144
 
 ; Request struct layout (must match parse.asm / vectorize.asm definitions).
 ; Used by fast_path_classify below; vectorize.asm reads the same offsets.
@@ -173,6 +166,18 @@ warm_body_len      equ warm_http_end - warm_body
     %error "warm_body_len != 407 — update the Content-Length header"
 %endif
 
+; epoll_params struct for EPIOCSPARAMS ioctl (Linux 6.9+).  Hands the kernel
+; a budget for NAPI busy-polling inside epoll_wait so we can skip the
+; userspace 256× epoll_wait(0) spin entirely.  busy_poll_usecs=50µs gives a
+; ~2.5%/sec idle CPU footprint at 900 req/s but slashes per-spin syscall
+; framework cost (~57% CPU → ~10-15%) because the spin becomes 1 syscall.
+align 8
+epoll_busy_params:
+    dd 50                                 ; busy_poll_usecs
+    dw 8                                  ; busy_poll_budget
+    db 1                                  ; prefer_busy_poll
+    db 0                                  ; __pad
+
 ; ===========================================================================
 section .bss
 
@@ -184,70 +189,43 @@ g_indices:  resb N_PARTITIONS * IX_SIZE
 
 alignb 16
 conn_state: resb MAX_FDS * STATE_SIZE       ; ~4.2 MB; indexed by fd
-events_buf: resb MAX_EVENTS * EPOLL_EV_SIZE ; unused now (kept for the
-                                            ; old epoll-based code that the
-                                            ; linker drops via --gc-sections)
+alignb 16
+events_buf: resb MAX_EVENTS * EPOLL_EV_SIZE
 ctrl_fd:    resd 1
 epoll_fd:   resd 1
-; Set to 1 after the first GET /ready completes its re-warm pass.  Keeps the
-; handler fast on every subsequent /ready poll the engine might issue.
-ready_warm_done: resb 1
-; one-shot init flag for arm_ctrl_recvmsg (msg_iov/iovlen/control are static)
-ctrl_recvmsg_inited: resb 1
 
-; io_uring state.  The Ring struct itself is 128 B; the recvmsg layout
-; below is reused across multishot completions, with the kernel rewriting
-; both the iov buffer and the cmsg control buffer in place each time.
-alignb 64
-g_ring:     resb URING_SIZE
-
-; Registered file table.  Slot 0 = ctrl_fd (LB → API control channel).
-; Client fds are NOT registered (they live too briefly to amortise the
-; IORING_REGISTER_FILES_UPDATE overhead).
-%define API_REG_CTRL_IDX  0
-alignb 4
-reg_files:  resd 1
-
-; Provided-buffer ring for multishot recv on client fds.
-;   - BUF_RING_ENTRIES must be a power of two.  Entry 0 is also the head of
-;     the ring (the `tail` field lives at offset 14 of entry 0), but its
-;     buffer payload is still usable as long as we always write the tail
-;     AFTER publishing the buffer contents on x86's TSO model.
-;   - Each buffer is BUF_SIZE bytes (4 KiB), enough for a single HTTP
-;     request including headers.
-;   - bgid = 0 (only one buffer group).
-;   - IORING_REGISTER_PBUF_RING requires page-aligned ring memory.
-%define BUF_RING_ENTRIES   256
-%define BUF_RING_MASK      (BUF_RING_ENTRIES - 1)
-%define BUF_RING_BGID      0
-alignb 4096
-buf_ring:   resb BUF_RING_ENTRIES * BUF_ENTRY_SIZE
-alignb 4096
-buf_pool:   resb BUF_RING_ENTRIES * BUF_SIZE
-alignb 4
-buf_ring_tail_cached: resd 1
-
-; Multishot recvmsg state for ctrl_fd → fd-batches from the LB.
-;   iobuf  — single-byte iov target (LB sends 'F' marker)
-;   iov    — struct iovec { iobuf, 1 }
-;   cmsg   — control buffer.  Linux 6.14+ kernels prepend an SO_PASSRIGHTS
-;           (cmsg_type = 84) housekeeping block before the SCM_RIGHTS that
-;           we asked for.  Each block costs CMSG_SPACE(4) = 24 B, so 256 B
-;           gives us comfortable headroom whatever the kernel emits.
-;   hdr    — struct msghdr the kernel re-fills on each recv
-alignb 16
-recvmsg_iobuf:    resb 16
-recvmsg_iov:      resb 16
-recvmsg_cmsg:     resb 256
-recvmsg_hdr:      resb 56
-
-; 4K-aliasing guard: forbid the recvmsg control plane and the per-request
-; instrumentation counters from landing at the same page offset.  Bits 0-11
-; of two recent load/store addresses match → Haswell predicts a false
-; dependency and emits a machine-clear (~15-25 cycles).  128 B is enough to
-; bump the next block past the aliasing window.
+; 4K-aliasing guard between conn_state/events_buf and the instrumentation
+; counters below.  Bits 0-11 of two recent load/store addresses matching
+; → Haswell predicts a false dependency and emits a machine-clear (~15-25
+; cycles).  128 B bumps the next block past the aliasing window.
 alignb 64
 g_alias_pad_a:    resb 128
+
+; Per-phase RDTSC counters (POST path only).  Single-thread accumulators,
+; no atomics needed.  dump_stats walks these in order and writes a hex line
+; to stderr every 1024 POSTs so `docker logs` can sample steady-state.
+;   *_cyc = sum of cycle deltas across all POSTs that exercised that phase
+;   *_cnt = number of POSTs that exercised that phase
+; total_cnt counts every POST that entered the pipeline regardless of branch.
+alignb 64
+phase_parse_cyc:    resq 1
+phase_parse_cnt:    resq 1
+phase_fp_cyc:       resq 1
+phase_fp_cnt:       resq 1
+phase_vec_cyc:      resq 1
+phase_vec_cnt:      resq 1
+phase_search_cyc:   resq 1
+phase_search_cnt:   resq 1
+phase_send_cyc:     resq 1
+phase_send_cnt:     resq 1
+; Per-syscall counters used to measure keep-alive reuse:
+;   recvmsg_cnt = SCM_RIGHTS receives on ctrl_fd (≈ new connections)
+;   recvfrom_cnt = client-fd reads (≈ HTTP requests served, includes /ready)
+; Ratio recvfrom_cnt/recvmsg_cnt = avg HTTP reqs per connection.
+phase_recvmsg_cnt:  resq 1
+phase_recvfrom_cnt: resq 1
+phase_total_cyc:    resq 1
+phase_total_cnt:    resq 1
 
 ; ===========================================================================
 section .text
@@ -518,6 +496,12 @@ http_frame:
     mov     eax, ecx                     ; return total
 
 .ret:
+    ; vzeroupper before unwinding so caller (and any syscall it makes before
+    ; the next AVX use, e.g. partial-recv re-entry into recvfrom) sees AVX
+    ; state "init" — kernel XSAVE/XRSTOR on syscall transition skips the
+    ; AVX block (the ymm14/ymm13 broadcasts above leave the upper halves
+    ; dirty otherwise).
+    vzeroupper
     add     rsp, 24
     pop     r15
     pop     r14
@@ -657,6 +641,15 @@ handle_request:
     movdqu  [rsp + 48], xmm0
     mov     qword [rsp + 64], 0          ; 8 bytes covers mcc+is_online..known_merchant (8 bytes)
 
+%ifdef INSTRUMENT
+    ; Instrumentation: latch req_start_tsc and phase_start_tsc.
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     [rsp + 104], rax
+    mov     [rsp + 112], rax
+%endif
+
     ; parse_request(buf + body_off, body_len, &req)
     ; (rcx still holds body_len: only pxor/movdqu/mov-imm above, none clobber)
     lea     rdi, [rbx + r13]             ; buf + body_off
@@ -666,12 +659,39 @@ handle_request:
     test    eax, eax
     jnz     .post_err                    ; parse_request != 0 → 400
 
+%ifdef INSTRUMENT
+    ; Instrumentation: parse_request delta.
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     rcx, rax
+    sub     rax, [rsp + 112]
+    add     [rel phase_parse_cyc], rax
+    inc     qword [rel phase_parse_cnt]
+    mov     [rsp + 112], rcx
+%endif
+
     ; Tier-1 fast-path: deterministic obvious_legit / obvious_fraud rules.
     ; Sub-200 ns and bypasses both vectorize + scan_cluster on the few
     ; queries that meet ALL conditions in either bucket.  Returns -1 when
     ; the verdict is ambiguous — that case falls through to the full k-NN.
     lea     rdi, [rsp + 0]
     call    fast_path_classify
+
+%ifdef INSTRUMENT
+    ; Instrumentation: fast_path_classify delta — preserve eax verdict.
+    mov     r9d, eax
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     rcx, rax
+    sub     rax, [rsp + 112]
+    add     [rel phase_fp_cyc], rax
+    inc     qword [rel phase_fp_cnt]
+    mov     [rsp + 112], rcx
+    mov     eax, r9d                     ; restore verdict
+%endif
+
     test    eax, eax
     js      .knn_path                    ; eax == -1 → ambiguous
     jmp     .fraud_ok                    ; eax ∈ {0, 5} → done
@@ -681,6 +701,18 @@ handle_request:
     lea     rdi, [rsp + 0]
     lea     rsi, [rsp + 72]
     call    vectorize
+
+%ifdef INSTRUMENT
+    ; Instrumentation: vectorize delta.
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     rcx, rax
+    sub     rax, [rsp + 112]
+    add     [rel phase_vec_cyc], rax
+    inc     qword [rel phase_vec_cnt]
+    mov     [rsp + 112], rcx
+%endif
 
     ; Derive partition tag = (unknown << 1) | has_last from Request.  Then
     ; route the search to the matching sub-index.  unknown = 1 - known.
@@ -694,7 +726,23 @@ handle_request:
     add     rdi, rax                                ; rdi = &g_indices[tag]
     lea     rsi, [rsp + 72]
     call    search
-    movzx   eax, al                      ; fraud in low byte, zero-ext
+
+%ifdef INSTRUMENT
+    ; Instrumentation: search delta — preserve eax (fraud_count).
+    mov     r9d, eax
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     rcx, rax
+    sub     rax, [rsp + 112]
+    add     [rel phase_search_cyc], rax
+    inc     qword [rel phase_search_cnt]
+    mov     [rsp + 112], rcx
+    movzx   eax, r9b                     ; restore fraud_count, zero-ext
+%else
+    movzx   eax, al                      ; zero-ext fraud_count (search ret ∈ 0..5)
+%endif
+
     cmp     eax, 5
     jbe     .fraud_ok
     mov     eax, 5
@@ -705,6 +753,27 @@ handle_request:
     mov     [r12], ecx
     lea     rdx, [fraud_resp_ptr_table]
     mov     rax, [rdx + rax*8]
+
+%ifdef INSTRUMENT
+    ; Instrumentation: POST total = t_now - req_start; dump every 1024.
+    mov     r8, rax                      ; preserve response ptr
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    sub     rax, [rsp + 104]
+    add     [rel phase_total_cyc], rax
+    inc     qword [rel phase_total_cnt]
+    mov     rcx, [rel phase_total_cnt]
+    test    ecx, 1023
+    jnz     .no_stats_dump
+    ; Stash response ptr in the (already-consumed) req_start slot so we
+    ; survive dump_stats without pushing (which would misalign rsp).
+    mov     [rsp + 104], r8
+    call    dump_stats
+    mov     r8,  [rsp + 104]
+.no_stats_dump:
+    mov     rax, r8                      ; restore response ptr
+%endif
     jmp     .ret
 
 .post_err:
@@ -722,17 +791,13 @@ handle_request:
     cmp     byte [rbx + 3], ' '
     jne     .err
 
-    ; First GET /ready triggers an additional warm pass — the engine's
-    ; health probe is the last hop before k6 fires its first request, so
-    ; refreshing the BPU + L1d/L1i tables here keeps the first batch of
-    ; real requests off cold-cache p99 outliers.  Once-only (flag in bss);
-    ; subsequent /ready polls return instantly.
-    cmp     byte [ready_warm_done], 0
-    jne     .skip_ready_warm
-    mov     byte [ready_warm_done], 1
-    call    warm_handle_request
-.skip_ready_warm:
-
+    ; (Previously: on the first GET /ready we re-ran warm_handle_request
+    ; here to refresh BPU/L1i.  That blocks the single-threaded event loop
+    ; for 5–50ms; under the epoll port it creates cascading backpressure
+    ; — LB.send_fd stalls on a full ctrl UDS queue, accept_loop stops
+    ; running, new TCP connections never get serviced.  The startup pass
+    ; in _start already primes the predictor; the marginal benefit of the
+    ; re-warm doesn't justify the deadlock window.)
     lea     rax, [ready_resp]
     mov     dword [r12], ready_resp_len
     jmp     .ret
@@ -762,6 +827,8 @@ send_all:
     push    rbp                          ; p (base)
     push    r12                          ; n (remaining bytes signed)
     push    r13                          ; off (sent so far)
+    push    r14                          ; t_start for per-sendto RDTSC timing
+                                         ; 5 pushes → rsp 0 mod 16 ✓
 
     mov     ebx, edi
     mov     rbp, rsi
@@ -772,6 +839,14 @@ send_all:
     cmp     r13, r12
     jge     .done
 
+%ifdef INSTRUMENT
+    ; --- RDTSC start (preserves nothing; we save into r14) ---
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     r14, rax
+%endif
+
     mov     edi, ebx                     ; fd
     lea     rsi, [rbp + r13]             ; p + off
     mov     rdx, r12
@@ -780,6 +855,18 @@ send_all:
     xor     r8d, r8d                     ; addr = NULL
     xor     r9d, r9d                     ; addrlen = 0
     syscall0 SYS_sendto
+
+%ifdef INSTRUMENT
+    ; --- RDTSC end + accumulate (preserve sendto retval in r9) ---
+    mov     r9, rax                      ; r9 preserved across SYSCALL per ABI
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    sub     rax, r14                     ; delta cycles
+    add     [rel phase_send_cyc], rax
+    inc     qword [rel phase_send_cnt]
+    mov     rax, r9                      ; restore sendto retval
+%endif
 
     test    rax, rax
     js      .check_eintr
@@ -793,6 +880,7 @@ send_all:
 
 .done:
     xor     eax, eax
+    pop     r14
     pop     r13
     pop     r12
     pop     rbp
@@ -801,6 +889,7 @@ send_all:
 
 .err:
     mov     eax, -1
+    pop     r14
     pop     r13
     pop     r12
     pop     rbp
@@ -985,16 +1074,21 @@ recv_client_fds:
     mov     [rsp + 184], eax
 
 .retry:
-    ; recvmsg(ctrl_fd, &msg, MSG_CMSG_CLOEXEC) — keep passed fds O_CLOEXEC
+    ; recvmsg(ctrl_fd, &msg, MSG_CMSG_CLOEXEC | MSG_DONTWAIT)
+    ; — keep passed fds O_CLOEXEC; non-blocking so EAGAIN cleanly signals
+    ;   "drained" to the epoll edge-triggered handler.
     mov     edi, ebx
     lea     rsi, [rsp + 128]
-    mov     edx, MSG_CMSG_CLOEXEC
+    mov     edx, MSG_CMSG_CLOEXEC | MSG_DONTWAIT
     syscall0 SYS_recvmsg
     cmp     rax, -EINTR
     je      .retry
     test    rax, rax
     js      .err
     jz      .eof
+%ifdef INSTRUMENT
+    inc     qword [rel phase_recvmsg_cnt]
+%endif
 
     ; Walk cmsg buffer: ptr = rsp+64, end = ptr + msg_controllen
     mov     r8, [rsp + 168]              ; actual msg_controllen (may shrink)
@@ -1091,741 +1185,304 @@ recv_client_fds:
     ret
 
 ; ===========================================================================
-; io_uring server loop
+; epoll event loop (single-thread, edge-triggered)
 ; ===========================================================================
-
-; ---- get_next_sqe ---------------------------------------------------------
-; Returns rax = pointer to the next free SQE in the ring; advances the
-; cached tail.  Returns rax = 0 if the ring is full (caller must submit
-; first).  Pure compute, no syscall.
 ;
-; No args; reads/writes g_ring.
-
-get_next_sqe:
-    ; tail = ring.tail_cached;  head = *ring.sq_head
-    mov     eax, [g_ring + URING_SQ_TAIL_CACHED]
-    mov     rcx, [g_ring + URING_SQ_HEAD]
-    mov     edx, [rcx]
-    ; if tail - head == sq_entries → full.  We allocated 256 slots; mask
-    ; works out to (tail - head) > mask → full.
-    mov     ecx, eax
-    sub     ecx, edx
-    cmp     ecx, [g_ring + URING_SQ_MASK]
-    ja      .full
-
-    ; slot = tail & mask
-    mov     ecx, eax
-    and     ecx, [g_ring + URING_SQ_MASK]
-    shl     ecx, SQE_SHIFT
-    mov     rdx, [g_ring + URING_SQES]
-    lea     rax, [rdx + rcx]              ; sqe ptr
-
-    ; tail_cached++
-    inc     dword [g_ring + URING_SQ_TAIL_CACHED]
-    ret
-
-.full:
-    xor     eax, eax
-    ret
-
-; ---- arm_ctrl_recvmsg -----------------------------------------------------
-; Re-arm (or first-arm) the multishot recvmsg on ctrl_fd.  Idempotent —
-; the msghdr/iov/cmsg buffers are reused across iterations, the kernel
-; just overwrites their content.
+; ctrl_fd  — Unix stream socket from LB carrying SCM_RIGHTS batches of
+;            accepted client TCP fds.  Registered EPOLLIN | EPOLLET.
+; client   — short-lived TCP fds attached on the fly.  Registered
+;            EPOLLIN | EPOLLET | EPOLLRDHUP so peer half-close fires
+;            without depending on a subsequent recv == 0.
 ;
-;   edi = ctrl_fd
+; Each event drains its source until EAGAIN before returning, as
+; required by edge-triggered semantics — otherwise the kernel won't
+; re-arm until the next state-change edge.
 
-arm_ctrl_recvmsg:
-    push    rbx
+; ---- handle_ctrl_event ----------------------------------------------------
+; Processes ONE batch of fds from the LB → API control socket (recv_client_fds
+; does a single recvmsg).  No drain loop — under level-triggered epoll plus
+; the server_loop_epoll busy-poll spin, any fd still queued in the kernel
+; buffer is observed on the very next epoll_wait(0) (~200 ns later) instead
+; of via an in-handler EAGAIN drain.  Saves one wasted recvmsg per ctrl event.
+
+handle_ctrl_event:
+    push    rbx                          ; ctrl_fd
+    push    r12                          ; nfds
+    push    r13                          ; iter i
+    sub     rsp, 288                     ; fds[64] (256B) + scratch (32B)
+                                         ;   [+4  ] epoll_event { events(4), fd(4) }
+                                         ;   [+16 ] nfds (4)
+                                         ;   [+32 ] fds[64] (256)
+
     mov     ebx, edi
 
-    ; Kernel only modifies msg_controllen / msg_namelen / msg_flags of msghdr
-    ; per recvmsg(2).  msg_iov / msg_iovlen / msg_control persist across
-    ; calls, and recvmsg_iov.iov_base / iov_len are constant.  Initialise
-    ; those persistent fields on the first arm only, then every subsequent
-    ; arm just resets msg_controllen (the one field the kernel shrinks).
-    cmp     byte [ctrl_recvmsg_inited], 0
-    jne     .arm_only
-
-    lea     rax, [recvmsg_iobuf]
-    mov     [recvmsg_iov + 0], rax
-    mov     qword [recvmsg_iov + 8], 1
-    lea     rax, [recvmsg_iov]
-    mov     [recvmsg_hdr + 16], rax
-    mov     qword [recvmsg_hdr + 24], 1
-    lea     rax, [recvmsg_cmsg]
-    mov     [recvmsg_hdr + 32], rax
-    mov     byte [ctrl_recvmsg_inited], 1
-.arm_only:
-    mov     qword [recvmsg_hdr + 40], 256
-
-    call    get_next_sqe
-    test    rax, rax
-    jz      .nosqe                        ; ring full → caller will retry later
-
-    ; Single-shot recvmsg against the registered ctrl_fd (slot 0).  Multishot
-    ; recvmsg would need an IORING_REGISTER_PBUF_RING (kernel consumes
-    ; provided buffers instead of msghdr's iov) and returns -EINVAL without
-    ; one — leading to a re-arm loop.  Re-arming once per fd batch is only
-    ; ~one SQE per accepted connection, negligible.
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_RECVMSG
-    mov     byte [rax + SQE_FLAGS], IOSQE_FIXED_FILE
-    mov     dword [rax + SQE_FD], API_REG_CTRL_IDX
-    mov     dword [rax + SQE_OP_FLAGS], MSG_CMSG_CLOEXEC
-    lea     rcx, [recvmsg_hdr]
-    mov     [rax + SQE_ADDR], rcx
-    ; user_data = UD_OP_RECVMSG | ctrl_fd (kept for diagnostics)
-    mov     rcx, UD_OP_RECVMSG
-    mov     edx, ebx
-    or      rcx, rdx
-    mov     [rax + SQE_USER_DATA], rcx
-
-.nosqe:
-    pop     rbx
-    ret
-
-; ---- init_buf_ring -------------------------------------------------------
-; Pre-fills the provided-buffer ring with every entry of buf_pool, registers
-; the ring with the kernel, then publishes the initial tail.  Called once
-; at startup after uring_init.  Returns eax = 0 OK / -1 on register error.
-
-init_buf_ring:
-    ; Publish entries 0..BUF_RING_ENTRIES-1.  Entry 0's payload sits in the
-    ; same 16 B as the io_uring_buf_ring head/tail metadata, but the kernel
-    ; only reads addr/len/bid from buf entries (offsets 0..13) and treats
-    ; offset 14..15 as the tail; those reads don't overlap so the dual use
-    ; is safe.  The final tail write must happen AFTER all buf data is in
-    ; place — x86 TSO guarantees that.
-    xor     ecx, ecx
-.fill:
-    cmp     ecx, BUF_RING_ENTRIES
-    jge     .fill_done
-    mov     eax, ecx
-    shl     eax, BUF_ENTRY_SHIFT          ; * 16
-    lea     rdi, [buf_ring]
-    add     rdi, rax                      ; entry ptr
-    mov     eax, ecx
-    shl     eax, 12                       ; * 4096 = BUF_SIZE
-    lea     rdx, [buf_pool]
-    add     rdx, rax                      ; buf addr
-    mov     [rdi + BUF_ADDR], rdx
-    mov     dword [rdi + BUF_LEN], BUF_SIZE
-    mov     word [rdi + BUF_BID], cx
-    mov     word [rdi + BUF_RESV], 0
-    inc     ecx
-    jmp     .fill
-.fill_done:
-
-    ; Publish initial tail BEFORE registering.  Tail field is at offset
-    ; 14 of entry 0; entry 0 also carries a buffer payload, but that's
-    ; fine because the kernel reads tail separately.  On x86 TSO this
-    ; final write is a release-store.
-    mov     word [buf_ring + 14], BUF_RING_ENTRIES
-    mov     dword [buf_ring_tail_cached], BUF_RING_ENTRIES
-
-    ; Register the ring.  buf_ring is the ring memory; entries count is
-    ; BUF_RING_ENTRIES; bgid is BUF_RING_BGID.
-    lea     rdi, [g_ring]
-    lea     rsi, [buf_ring]
-    mov     edx, BUF_RING_ENTRIES
-    mov     ecx, BUF_RING_BGID
-    call    uring_register_pbuf_ring
-    test    eax, eax
-    js      .fail
-
-    xor     eax, eax
-.fail:
-    ret
-
-; ---- publish_buffer ------------------------------------------------------
-; Re-publishes one consumed buffer (by buf_id) back into the ring.  Caller
-; passes edi = buf_id (0..BUF_RING_ENTRIES-1).  Pure compute, no syscall.
-
-publish_buffer:
-    ; slot = tail_cached & MASK
-    mov     eax, [buf_ring_tail_cached]
-    mov     ecx, eax
-    and     ecx, BUF_RING_MASK
-    shl     ecx, BUF_ENTRY_SHIFT
-    lea     rdx, [buf_ring]
-    add     rdx, rcx                     ; entry ptr
-
-    ; addr = buf_pool + buf_id * BUF_SIZE
-    mov     ecx, edi
-    shl     ecx, 12                       ; * 4096
-    lea     r8, [buf_pool]
-    add     r8, rcx
-    mov     [rdx + BUF_ADDR], r8
-    mov     dword [rdx + BUF_LEN], BUF_SIZE
-    mov     word [rdx + BUF_BID], di
-
-    ; Advance tail (publish; tail field lives at buf_ring + 14)
-    inc     eax
-    mov     [buf_ring_tail_cached], eax
-    mov     word [buf_ring + 14], ax
-    ret
-
-; ---- arm_client_recv ------------------------------------------------------
-; Multishot recv with provided buffer ring.  One SQE keeps generating CQEs
-; for every chunk of bytes arriving on fd; the kernel picks a buffer from
-; bgid=0 for each completion.  CQE.flags carries the buf_id in the high 16
-; bits and IORING_CQE_F_BUFFER as the marker.
-;
-;   edi = fd
-
-arm_client_recv:
-    push    rbx
-    mov     ebx, edi
-
-    call    get_next_sqe
-    test    rax, rax
-    jz      .nosqe
-
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_RECV
-    mov     byte [rax + SQE_FLAGS], IOSQE_BUFFER_SELECT
-    mov     word [rax + SQE_IOPRIO], IORING_RECV_MULTISHOT
-    mov     dword [rax + SQE_FD], ebx
-    mov     word [rax + SQE_BUF_GROUP], BUF_RING_BGID
-    mov     rcx, UD_OP_RECV
-    mov     edx, ebx
-    or      rcx, rdx
-    mov     [rax + SQE_USER_DATA], rcx
-
-.nosqe:
-    pop     rbx
-    ret
-
-; ---- arm_client_send ------------------------------------------------------
-; Submits a send for the response.  CQE_SKIP_SUCCESS keeps the CQ empty on
-; the happy path (kernel only reports failures), so we never have to
-; dispatch a SEND completion.
-;
-;   edi = fd, rsi = buf, edx = len
-
-arm_client_send:
-    push    rbx                          ; fd
-    push    rbp                          ; buf
-    push    r12                          ; len
-
-    mov     ebx, edi
-    mov     rbp, rsi
-    mov     r12d, edx
-
-    call    get_next_sqe
-    test    rax, rax
-    jnz     .have_sqe
-
-    ; SQ full: kick the kernel to drain submitted SQEs, then retry.
-    lea     rdi, [g_ring]
-    call    uring_submit_no_wait
-    call    get_next_sqe
-    test    rax, rax
-    jz      .nosqe                        ; still full → force close (no fd leak)
-
-.have_sqe:
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_SEND
-    mov     byte [rax + SQE_FLAGS], IOSQE_CQE_SKIP_SUCCESS
-    mov     dword [rax + SQE_FD], ebx
-    mov     [rax + SQE_ADDR], rbp
-    mov     dword [rax + SQE_LEN], r12d
-    mov     dword [rax + SQE_OP_FLAGS], MSG_NOSIGNAL
-    mov     rcx, UD_OP_SEND
-    mov     edx, ebx
-    or      rcx, rdx
-    mov     [rax + SQE_USER_DATA], rcx
-    pop     r12
-    pop     rbp
-    pop     rbx
-    ret
-
-.nosqe:
-    ; Cannot enqueue send → drop the connection rather than leak the fd.
     mov     edi, ebx
-    call    arm_client_close
-    pop     r12
-    pop     rbp
-    pop     rbx
-    ret
+    lea     rsi, [rsp + 32]              ; out_fds
+    mov     edx, 64                       ; max_fds
+    lea     rcx, [rsp + 16]              ; &nfds
+    call    recv_client_fds
+    test    eax, eax
+    js      .done                         ; -1 → recvmsg err (EAGAIN included)
+    jz      .done                         ; 0  → EOF
 
-; ---- arm_client_close -----------------------------------------------------
-; Single CLOSE SQE.  Reverted from CANCEL+SHUTDOWN+CLOSE chain (which cost
-; ~200ns/req in extra SQE enqueues) because the corpus doesn't trigger the
-; defensive scenarios (RST on truncated response / stray recv CQE).  Kernel
-; auto-terminates the multishot recv when CLOSE completes.
-;   edi = fd
+    mov     r12d, [rsp + 16]
+    test    r12d, r12d
+    jz      .done                         ; no fds in this batch — return
 
-arm_client_close:
-    push    rbx
-    mov     ebx, edi
-    call    get_next_sqe
-    test    rax, rax
-    jz      .nosqe
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_CLOSE
-    mov     dword [rax + SQE_FD], ebx
-    mov     rcx, UD_OP_CLOSE
-    mov     edx, ebx
-    or      rcx, rdx
-    mov     [rax + SQE_USER_DATA], rcx
-.nosqe:
-    pop     rbx
-    ret
+    xor     r13d, r13d
+.add_loop:
+    cmp     r13d, r12d
+    jge     .done
 
-; ---- parse_cmsg_extract_fds -----------------------------------------------
-; Walks one SCM_RIGHTS-bearing msg_control buffer and registers every fd
-; with the io_uring loop (zero its conn_state buf_pos + submit recv).
-;   rdi = msg_control ptr
-;   esi = msg_controllen
+    mov     eax, [rsp + 32 + r13*4]      ; new client fd
 
-parse_cmsg_extract_fds:
-    push    rbx                          ; cmsg cursor
-    push    rbp                          ; cmsg end
+    ; Bounds check: conn_state is fd-indexed with MAX_FDS slots.  Under
+    ; normal operation the kernel allocates the lowest free fd so values
+    ; stay well below MAX_FDS, but a leak or burst could push past.  Close
+    ; oversize fds rather than OOB-write conn_state (which would clobber
+    ; events_buf / ctrl_fd / epoll_fd / phase counters).
+    cmp     eax, MAX_FDS
+    jae     .reject_fd
 
-    mov     rbx, rdi
-    movsxd  rbp, esi
-    add     rbp, rbx                     ; end = ctrl + ctrllen
-
-.walk:
-    lea     rax, [rbx + 16]
-    cmp     rax, rbp
-    ja      .done
-
-    mov     rdi, [rbx + 0]               ; cmsg_len
-    cmp     rdi, 16
-    jb      .done
-    mov     rax, rbp
-    sub     rax, rbx                     ; remaining bytes
-    cmp     rdi, rax
-    ja      .done                        ; cmsg_len overruns buffer → bail
-    mov     eax, [rbx + 8]
-    cmp     eax, SOL_SOCKET
-    jne     .next
-    mov     eax, [rbx + 12]
-    cmp     eax, SCM_RIGHTS
-    jne     .next
-
-    ; n_fds = (cmsg_len - 16) / 4
-    mov     r10, rdi
-    sub     r10, 16
-    shr     r10, 2
-    lea     r11, [rbx + 16]              ; fds base
-    xor     ecx, ecx
-.fd_loop:
-    cmp     ecx, r10d
-    jge     .next
-    mov     edi, [r11 + rcx*4]           ; fd
-
-    ; Zero this fd's buf_pos before arming the recv.
-    movsxd  rax, edi
-    imul    rax, rax, STATE_SIZE
+    ; reset state.buf_pos for this fd (fd may be a reused number)
+    movsxd  rcx, eax
+    imul    rcx, rcx, STATE_SIZE
     lea     rdx, [conn_state]
-    mov     dword [rdx + rax + STATE_BUF_POS], 0
+    mov     dword [rdx + rcx + STATE_BUF_POS], 0
 
-    push    rcx
-    push    r10
-    push    r11
+    ; epoll_ctl(ADD, fd, EPOLLIN | EPOLLRDHUP)
+    ; Level-triggered: busy-poll spin guarantees we re-observe buffered data
+    ; on the next ~200 ns poll cycle without needing the EAGAIN drain loops.
+    mov     dword [rsp + 4], EPOLLIN | EPOLLRDHUP
+    mov     [rsp + 8], eax
+    mov     edi, [epoll_fd]
+    mov     esi, EPOLL_CTL_ADD
+    mov     edx, eax
+    lea     r10, [rsp + 4]
+    syscall0 SYS_epoll_ctl
 
-    ; TCP_QUICKACK on the newly received client fd.  The LB's earlier
-    ; setsockopt was effectively a no-op (LB never recv()s, the option
-    ; is one-shot until the next ACK).  Setting it here on the receiver
-    ; side makes the first response to k6 skip the delayed-ACK window.
-    ; Synchronous syscall — ~200ns one-time cost per accepted connection.
-    push    rdi                          ; save fd across syscall
-    sub     rsp, 8                       ; optval int (4) + align
-    mov     dword [rsp], 1
-    mov     esi, SOL_TCP
-    mov     edx, TCP_QUICKACK
-    lea     r10, [rsp]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-    add     rsp, 8
-    pop     rdi                          ; restore fd
+    inc     r13d
+    jmp     .add_loop
 
-    call    arm_client_recv
-    pop     r11
-    pop     r10
-    pop     rcx
-    inc     ecx
-    jmp     .fd_loop
-
-.next:
-    mov     rax, [rbx + 0]
-    add     rax, 7
-    and     rax, -8
-    add     rbx, rax
-    jmp     .walk
+.reject_fd:
+    ; Oversize fd — close locally and continue (no epoll_ctl ADD, so no
+    ; later DEL is needed).  Preserves r12/r13 (callee-save under SysV).
+    mov     edi, eax
+    syscall0 SYS_close
+    inc     r13d
+    jmp     .add_loop
 
 .done:
-    pop     rbp
-    pop     rbx
-    ret
-
-; ---- handle_recvmsg_cqe ---------------------------------------------------
-; Called on every multishot recvmsg completion against ctrl_fd.  The kernel
-; has refilled recvmsg_hdr/cmsg in place with the new batch's fds.
-;   edi = ctrl_fd (low 32 of user_data)
-;   esi = cqe.res
-;   r8d = cqe.flags
-; Returns eax: 0 normal, -2 if ctrl channel closed (LB hung up).
-
-handle_recvmsg_cqe:
-    push    rbx                          ; ctrl_fd
-    push    r12                          ; saved cqe.flags
-    sub     rsp, 8
-
-    mov     ebx, edi
-    mov     r12d, r8d
-
-    test    esi, esi
-    js      .err
-    jz      .eof
-
-    ; Walk cmsg from the actual controllen (may have shrunk).  msg_controllen
-    ; sits at +40 of the kernel-rewritten msghdr.  Linux 6.14+ adds an
-    ; SO_PASSRIGHTS housekeeping cmsg ahead of the SCM_RIGHTS we asked for,
-    ; so parse_cmsg_extract_fds is built to skip unknown cmsg types.
-    mov     rdi, [recvmsg_hdr + 32]      ; msg_control ptr (we set it; kernel doesn't change)
-    mov     esi, dword [recvmsg_hdr + 40]
-    call    parse_cmsg_extract_fds
-
-    ; Single-shot: each completion drains one batch of fds; re-arm for the
-    ; next batch.  IORING_CQE_F_MORE is never set on single-shot CQEs.
-    mov     edi, ebx
-    call    arm_ctrl_recvmsg
-
-.ok:
-    xor     eax, eax
-    jmp     .ret
-.eof:
-    mov     eax, -2
-    jmp     .ret
-.err:
-    ; recvmsg with a transient error (e.g. -EINTR).  Re-arm; if the channel
-    ; is truly broken the next recvmsg returns 0 (EOF) which stops us.
-    mov     edi, ebx
-    call    arm_ctrl_recvmsg
-    xor     eax, eax
-.ret:
-    add     rsp, 8
+    add     rsp, 288
+    pop     r13
     pop     r12
     pop     rbx
     ret
 
-; ---- handle_recv_cqe ------------------------------------------------------
-; A multishot recv fired for a client fd.  CQE flags carry the buf_id in
-; the high 16 bits + IORING_CQE_F_BUFFER as a marker (when bytes were
-; copied) + IORING_CQE_F_MORE while the multishot is still armed.
+; ---- handle_client_event --------------------------------------------------
+; Drains an EPOLLET client fd: recv into conn_state[fd].buf until EAGAIN,
+; frames complete HTTP requests inline, handles them, sends the response
+; via send_all (blocking).  On EOF / error / oversized payload, removes
+; the fd from epoll and closes.
+;   edi = fd
 ;
-; Lifecycle per CQE:
-;   1. Extract buf_id; locate buf_addr in buf_pool.
-;   2. If conn_state has accumulated bytes from a previous partial frame,
-;      append the new bytes there and parse from conn_state; otherwise
-;      parse directly from the kernel buffer (no memcpy on golden path).
-;   3. For each complete frame: handle_request → send response.
-;   4. Stash any tail partial into conn_state for the next CQE.
-;   5. Re-publish the buffer back to the ring.
-;   6. If the kernel cleared F_MORE (multishot ended), re-arm.
+; Stack frame: 2 pushes (rbx + rbp) + sub 24 → rsp 0 mod 16 before any CALL.
+;   entry rsp%16 = 8 (after CALL pushed return addr) → 2 pushes (16 B) →
+;   rsp%16 = 8 still → sub 24 → rsp%16 = 0 ✓
+;   Slots used: [+0]body_off, [+4]body_len, [+8]total, [+12]out_len (16B).
+;   Remaining 8B is padding to keep CALL alignment.
 ;
-;   edi = fd, esi = res, r8d = cqe.flags
+;   Note: parse_request / vectorize / search internally re-align via
+;   `and rsp, -64`, so they didn't crash on the previous misaligned frame.
+;   But http_frame uses xmm14/15 in `vmovd`/`vpbroadcastb` (unaligned-safe)
+;   and pads via push, so no #GP either.  The bug was elsewhere — but the
+;   ABI demands alignment regardless.
 
-handle_recv_cqe:
+handle_client_event:
     push    rbx                          ; fd
     push    rbp                          ; state ptr
-    push    r12                          ; res
-    push    r13                          ; buf_id
-    push    r14                          ; work_buf
-    push    r15                          ; cqe flags
-    sub     rsp, 32                       ; locals:
-                                         ;   [+0]  body_off
-                                         ;   [+4]  body_len
-                                         ;   [+8]  total
-                                         ;   [+12] out_len
-                                         ;   [+16] work_len
+    sub     rsp, 24
 
     mov     ebx, edi
-    mov     r12d, esi
-    mov     r15d, r8d
-
     movsxd  rax, ebx
     imul    rax, rax, STATE_SIZE
     lea     rbp, [conn_state]
     add     rbp, rax
 
-    ; Compute buf_id and buf_addr only when F_BUFFER is set; otherwise the
-    ; CQE carries no buffer (e.g., -ENOBUFS, EOF without payload).
-    test    r15d, IORING_CQE_F_BUFFER
-    jz      .check_status
-    mov     r13d, r15d
-    shr     r13d, IORING_CQE_BUFFER_SHIFT
-    movzx   r13d, r13w
-    mov     eax, r13d
-    shl     eax, 12                       ; * 4096
-    lea     r14, [buf_pool]
-    add     r14, rax
+.recv_more:
+    mov     ecx, [rbp + STATE_BUF_POS]
+    cmp     ecx, BUF_SIZE
+    jae     .close                       ; buffer full — oversized request
 
-.check_status:
-    test    r12d, r12d
-    js      .close                        ; recv error
+    mov     edi, ebx
+    lea     rsi, [rbp + rcx]
+    mov     edx, BUF_SIZE
+    sub     edx, ecx                       ; nbytes available
+    mov     r10d, MSG_DONTWAIT
+    xor     r8, r8                         ; src_addr  (NULL — don't peek)
+    xor     r9, r9                         ; addrlen
+    syscall0 SYS_recvfrom
+    test    rax, rax
     jz      .close                        ; EOF
-    test    r15d, IORING_CQE_F_BUFFER
-    jz      .close                        ; res>0 but no buffer would be a
-                                          ; kernel anomaly — abort cleanly
+    js      .recv_err
+%ifdef INSTRUMENT
+    inc     qword [rel phase_recvfrom_cnt]
+%endif
 
-    ; If conn_state holds a partial frame, append new bytes there.  Else
-    ; parse directly from the kernel buffer (no memcpy on the golden path).
+    ; CRITICAL: SYSCALL clobbers rcx (kernel writes RIP_after_syscall into
+    ; rcx and rflags into r11 — Intel SDM, SYSCALL semantics).  Reload
+    ; buf_pos from memory; using the stale ecx as the running counter was
+    ; a long-standing bug that corrupted STATE_BUF_POS with the next-PC
+    ; value, making http_frame parse phantom requests.
+    mov     ecx, [rbp + STATE_BUF_POS]
+    add     ecx, eax
+    mov     [rbp + STATE_BUF_POS], ecx
+
+.frame_loop:
     mov     edx, [rbp + STATE_BUF_POS]
     test    edx, edx
-    jnz     .accumulate
+    jz      .recv_more
 
-    mov     [rsp + 16], r12d              ; work_len = res
-    jmp     .drain
-
-.accumulate:
-    ; Bound check before the append.  Without this, a request whose body
-    ; spans multiple multishot CQEs can grow the accumulator past
-    ; BUF_SIZE (4096) and smash STATE_BUF_POS / the next fd's conn_state.
-    ; Oversized payload → drop the connection cleanly.
-    mov     eax, edx
-    add     eax, r12d
-    cmp     eax, BUF_SIZE
-    ja      .close
-
-    push    rdx                          ; save buf_pos
-    lea     rdi, [rbp + rdx]
-    mov     rsi, r14
-    movsxd  rcx, r12d
-    cld
-    rep     movsb
-    pop     rdx
-    add     edx, r12d
-    mov     [rbp + STATE_BUF_POS], edx
-    mov     r14, rbp                      ; work_buf = conn_state.buf
-    mov     [rsp + 16], edx
-    ; fallthrough
-
-.drain:
-    mov     edx, [rsp + 16]
-    test    edx, edx
-    jz      .all_consumed
-
-    mov     rdi, r14
+    ; http_frame(buf, total, &body_off, &body_len) → eax = bytes consumed
+    ; or 0 if partial frame (need more bytes).
+    mov     rdi, rbp                      ; buf at offset 0 of state
     mov     esi, edx
-    lea     rdx, [rsp + 0]
-    lea     rcx, [rsp + 4]
+    lea     rdx, [rsp + 0]                ; &body_off
+    lea     rcx, [rsp + 4]                ; &body_len
     call    http_frame
     test    eax, eax
-    jz      .partial
+    jz      .recv_more                    ; partial — wait for more
 
-    mov     [rsp + 8], eax
+    mov     [rsp + 8], eax                ; consumed
 
-    mov     rdi, r14
+    ; handle_request(buf, total, body_off, body_len, &out_len) → rax = ptr
+    mov     rdi, rbp
     mov     esi, eax
     mov     edx, [rsp + 0]
     mov     ecx, [rsp + 4]
     lea     r8,  [rsp + 12]
     call    handle_request
 
+    ; send_all(fd, response, out_len)
     mov     edi, ebx
     mov     rsi, rax
     mov     edx, [rsp + 12]
-    call    arm_client_send
+    call    send_all
+    test    eax, eax
+    js      .close                        ; send error → drop connection
 
-    movsxd  rax, dword [rsp + 8]
-    add     r14, rax
-    mov     ecx, [rsp + 16]
+    ; Shift any leftover bytes (pipelined request) to start of buffer.
+    mov     ecx, [rbp + STATE_BUF_POS]
+    mov     eax, [rsp + 8]                ; consumed
     sub     ecx, eax
-    mov     [rsp + 16], ecx
-    jmp     .drain
-
-.all_consumed:
-    mov     dword [rbp + STATE_BUF_POS], 0
-    jmp     .republish
-
-.partial:
-    mov     ecx, [rsp + 16]
-    cmp     r14, rbp
-    je      .partial_inplace
-    cmp     ecx, BUF_SIZE
-    jae     .close                        ; oversized partial → abort
-    mov     rdi, rbp
-    mov     rsi, r14
-    movsxd  rdx, ecx
+    jz      .all_consumed
+    ; memmove(buf, buf + consumed, remaining)
     push    rcx
-    mov     rcx, rdx
+    mov     rdi, rbp
+    movsxd  r9, eax
+    lea     rsi, [rbp + r9]
+    movsxd  rcx, ecx
     cld
     rep     movsb
     pop     rcx
     mov     [rbp + STATE_BUF_POS], ecx
-    jmp     .republish
-.partial_inplace:
-    mov     [rbp + STATE_BUF_POS], ecx
+    jmp     .frame_loop
 
-.republish:
-    mov     edi, r13d
-    call    publish_buffer
-
-    ; Re-arm multishot only if the kernel told us it ended (CQE_F_MORE
-    ; clear).  Steady state pays zero submission cost.
-    test    r15d, IORING_CQE_F_MORE
-    jnz     .ret
-    mov     edi, ebx
-    call    arm_client_recv
+.all_consumed:
+    mov     dword [rbp + STATE_BUF_POS], 0
+    ; Under level-triggered epoll + busy-poll, if the kernel queue still has
+    ; pipelined-request bytes for this fd, the next epoll_wait(0) (≤ 200 ns
+    ; away inside server_loop_epoll's spin) will re-fire EPOLLIN for it.
+    ; That makes the trailing drain recvfrom (which usually just returns
+    ; EAGAIN) redundant — drop it to skip 1 syscall per request on the hot
+    ; path.  Saves ~30-50 µs/req measured (varies by load).
     jmp     .ret
 
+.recv_err:
+    ; EWOULDBLOCK == EAGAIN on Linux — single check covers both.
+    cmp     rax, -EAGAIN
+    je      .ret
+    cmp     rax, -EINTR
+    je      .recv_more
+    ; fall through → close
+
 .close:
-    ; Release any buffer the kernel gave us before closing.
-    test    r15d, IORING_CQE_F_BUFFER
-    jz      .close_no_buf
-    mov     edi, r13d
-    call    publish_buffer
-.close_no_buf:
+    ; epoll_ctl(DEL) is implicit on close(), but explicit DEL guards against
+    ; a stale event already sitting in events_buf that we'd dispatch later.
+    mov     edi, [epoll_fd]
+    mov     esi, EPOLL_CTL_DEL
+    mov     edx, ebx
+    xor     r10, r10
+    syscall0 SYS_epoll_ctl
+
     mov     edi, ebx
-    call    arm_client_close
+    syscall0 SYS_close
+
+    mov     dword [rbp + STATE_BUF_POS], 0
 
 .ret:
-    add     rsp, 32
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
+    add     rsp, 24
     pop     rbp
     pop     rbx
     ret
 
-; ---- handle_close_cqe -----------------------------------------------------
-; A close SQE has completed.  Reset that fd's state so it's ready for reuse.
-;   edi = fd
+; ---- server_loop_epoll ----------------------------------------------------
+; Single-threaded event loop, kernel-side busy poll edition.
+;
+; Previously this loop spun on epoll_wait(timeout=0) up to SPIN_BUDGET=256
+; times before falling back to a blocking wait — burning ~50% of CPU on
+; syscall framework overhead (entry_SYSRETQ + seccomp + FPU restore).
+;
+; With EPIOCSPARAMS (set on the epoll at startup, Linux 6.9+), the kernel
+; busy-polls NAPI for 50 µs INSIDE every epoll_wait before sleeping.  We
+; thus collapse the userspace spin into a SINGLE epoll_wait(timeout=1ms)
+; per iteration:
+;   - if an event arrives in the kernel busy-poll window → return < 50 µs
+;   - else sleep for up to 1 ms (CFS-friendly)
+;
+; This trades ~256 syscalls per idle window (≈2.5 ms framework / spin)
+; for ~1 syscall (≈10 µs framework / spin).  Pre-6.9 kernels treat the
+; ioctl as ENOTTY and behave as if the busy-poll knob were never set —
+; equivalent to the old blocking-only path.
+;
+; ctrl_fd was already added to the epoll set by _start.
 
-handle_close_cqe:
-    movsxd  rax, edi
-    imul    rax, rax, STATE_SIZE
-    lea     rcx, [conn_state]
-    mov     dword [rcx + rax + STATE_BUF_POS], 0
-    ret
-
-; ---- server_loop_uring ---------------------------------------------------
-; The new main loop.  Drains all available CQEs, then submits+waits via
-; uring_submit_and_wait.  Returns when the LB hangs up the ctrl channel.
-;   edi = ctrl_fd
-
-global server_loop_uring
-server_loop_uring:
-    push    rbx                          ; ctrl_fd
-    push    rbp                          ; cqe iterator
-    push    r12                          ; cqe pointer
-    push    r13                          ; saved tail
-    push    r14                          ; saved head
-    push    r15                          ; cqes base + mask cache
-    sub     rsp, 8                        ; rsp 0 mod 16
-
-    mov     ebx, edi
-    mov     [ctrl_fd], ebx                ; for completeness
-
-    ; First arm
-    mov     edi, ebx
-    call    arm_ctrl_recvmsg
+server_loop_epoll:
+    push    rbx                          ; n events
+    push    r12                          ; iter i
+    sub     rsp, 8                       ; align (2 push + 8 + ret = 32 → 0 mod 16)
 
 .outer:
-    ; head = *cq_head, tail = *cq_tail
-    mov     r15, [g_ring + URING_CQ_HEAD]
-    mov     ebp, [r15]                    ; head
-    mov     rax, [g_ring + URING_CQ_TAIL]
-    mov     r13d, [rax]                   ; tail
-    cmp     ebp, r13d
-    je      .submit_wait
+    mov     edi, [epoll_fd]
+    lea     rsi, [events_buf]
+    mov     edx, MAX_EVENTS
+    mov     r10d, 1                      ; 1 ms timeout; kernel busy-polls 50 µs first
+    syscall0 SYS_epoll_wait
+    cmp     rax, -EINTR
+    je      .outer
+    test    rax, rax
+    jle     .outer                       ; error or timeout — just retry
 
-    mov     r14, [g_ring + URING_CQES]
-    mov     r12d, [g_ring + URING_CQ_MASK]
+    mov     ebx, eax
+    xor     r12d, r12d
+.ev_loop:
+    cmp     r12d, ebx
+    jge     .outer
 
-.cqe_loop:
-    cmp     ebp, r13d
-    je      .drained
+    movsxd  rax, r12d
+    imul    rax, rax, EPOLL_EV_SIZE
+    lea     rdx, [events_buf]
+    mov     edi, [rdx + rax + EPOLL_EV_FD]
 
-    ; cqe = cqes + (head & mask) * 16
-    mov     eax, ebp
-    and     eax, r12d
-    shl     eax, CQE_SHIFT
-    lea     rcx, [r14 + rax]              ; cqe
-
-    ; Load user_data, res, flags
-    mov     rax, [rcx + CQE_USER_DATA]
-    mov     esi, [rcx + CQE_RES]
-    mov     r8d, [rcx + CQE_FLAGS]
-
-    ; Dispatch on op (high 32 bits).  fd is low 32 bits → rdi.
-    mov     edi, eax                      ; fd
-    shr     rax, 32                       ; op
-    cmp     eax, UD_OP_RECV >> UD_OP_SHIFT
-    je      .h_recv
-    cmp     eax, UD_OP_RECVMSG >> UD_OP_SHIFT
-    je      .h_recvmsg
-    cmp     eax, UD_OP_SEND >> UD_OP_SHIFT
-    je      .h_send
-    cmp     eax, UD_OP_CLOSE >> UD_OP_SHIFT
-    je      .h_close
-    cmp     eax, UD_OP_CANCEL >> UD_OP_SHIFT
-    je      .next                            ; CANCEL CQE is informational (success or -ENOENT)
-    ; Unknown op — ignore.
+    cmp     edi, [ctrl_fd]
+    je      .h_ctrl
+    call    handle_client_event
     jmp     .next
-
-.h_recv:
-    call    handle_recv_cqe
-    jmp     .next
-.h_recvmsg:
-    call    handle_recvmsg_cqe
-    cmp     eax, -2
-    je      .stop
-    jmp     .next
-.h_send:
-    ; With IOSQE_CQE_SKIP_SUCCESS we only land here on send errors; force
-    ; the fd closed so we don't get stuck holding a half-broken connection.
-    test    esi, esi
-    jns     .next
-    call    arm_client_close
-    jmp     .next
-.h_close:
-    call    handle_close_cqe
-    ; fallthrough
-
+.h_ctrl:
+    call    handle_ctrl_event
 .next:
-    inc     ebp
-    jmp     .cqe_loop
-
-.drained:
-    mov     [r15], ebp                    ; publish new cq head
-
-.submit_wait:
-    lea     rdi, [g_ring]
-    mov     esi, 1
-    call    uring_submit_and_wait
-    ; -EINTR / transient: keep looping.  Any positive return is the count of
-    ; SQEs the kernel ingested; ignored.
-    jmp     .outer
-
-.stop:
-    mov     [r15], ebp
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbp
-    pop     rbx
-    ret
-
-; ---- warm_handle_request -------------------------------------------------
-; Pre-runs the full handle_request pipeline (POST detect → parse_request →
-; vectorize → search → format response) N times against a static request
-; baked into .rodata.  Catches code paths that warm_index does not exercise
-; — parse, vectorize, the POST branch of handle_request, the fraud_resp
-; lookup table — so by the time the first real client arrives, both branch
-; predictors and L1i are saturated with the production hot path.
-;
-; No I/O: handle_request is pure compute, so this is safe to run before
-; the LB is even connected.
+    inc     r12d
+    jmp     .ev_loop
 
 %define WARM_REQ_ITERS 1000
 
@@ -1970,6 +1627,146 @@ warm_index:
     pop     rbx
     ret
 
+; ---- emit_hex_u64 ---------------------------------------------------------
+; Writes 16 ASCII hex chars (big-endian, fixed width, no prefix) for the
+; qword in rax into [rdi..rdi+15]; advances rdi by 16.  Clobbers rax, rcx,
+; rdx, r8.  Used by dump_stats only — not on the request hot path.
+
+emit_hex_u64:
+    mov     rcx, 16
+    lea     r8,  [rel dbg_hex]
+.lp:
+    mov     rdx, rax
+    shr     rdx, 60
+    and     edx, 0xF
+    mov     dl,  [r8 + rdx]
+    mov     [rdi], dl
+    inc     rdi
+    shl     rax, 4
+    dec     rcx
+    jnz     .lp
+    ret
+
+; ---- dump_stats -----------------------------------------------------------
+; Writes one line to stderr (fd 2) with the current per-phase counters:
+;   STATS p=HHHHHHHHHHHHHHHH pn=... f=... fn=... v=... vn=... s=... sn=...
+;          w=... wn=... rm=... rf=... t=... tn=...\n
+; 16-char zero-padded hex per field.  Total formatted line = 280 B (14 hex
+; fields × 19-or-20 B + 1 B newline).  Called once per 1024 POSTs from
+; handle_request — never on hot path.
+
+dump_stats:
+    ; Entry rsp = 8 mod 16 (per SysV).  Sub 296 = 304-8 lands rsp at 0 mod 16
+    ; so the inner CALLs to emit_hex_u64 are properly aligned.  Buffer area
+    ; is 296 B (formatted line is 280 B, +16 B headroom for future fields).
+    sub     rsp, 296
+
+    ; Layout the line in [rsp..rsp+280).  Headers are 8-byte stores so each
+    ; mov writes "STATS p=", " pn=    ", etc. in one go (label + 16 hex).
+    lea     rdi, [rsp]
+
+    mov     rax, 0x3D70205354415453   ; "STATS p="
+    mov     [rdi], rax
+    add     rdi, 8
+    mov     rax, [rel phase_parse_cyc]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6E7020           ; " pn="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_parse_cnt]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6620             ; " f="
+    mov     [rdi], eax
+    add     rdi, 3
+    mov     rax, [rel phase_fp_cyc]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6E6620           ; " fn="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_fp_cnt]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D7620             ; " v="
+    mov     [rdi], eax
+    add     rdi, 3
+    mov     rax, [rel phase_vec_cyc]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6E7620           ; " vn="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_vec_cnt]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D7320             ; " s="
+    mov     [rdi], eax
+    add     rdi, 3
+    mov     rax, [rel phase_search_cyc]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6E7320           ; " sn="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_search_cnt]
+    call    emit_hex_u64
+
+    ; "w" = write/sendto cycles, "wn" = sendto count.  Per-syscall sendto
+    ; latency = w/wn measures the kernel-side response-write cost without
+    ; the ptrace overhead that inflated the strace-measured 37-158 µs.
+    mov     eax, 0x3D7720             ; " w="
+    mov     [rdi], eax
+    add     rdi, 3
+    mov     rax, [rel phase_send_cyc]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6E7720           ; " wn="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_send_cnt]
+    call    emit_hex_u64
+
+    ; " rm=" recvmsg count, " rf=" recvfrom count.  Ratio rf/rm = HTTP reqs
+    ; per connection (keep-alive reuse).  High ratio = handoff batching low ROI.
+    mov     eax, 0x3D6D7220           ; " rm="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_recvmsg_cnt]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D667220           ; " rf="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_recvfrom_cnt]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D7420             ; " t="
+    mov     [rdi], eax
+    add     rdi, 3
+    mov     rax, [rel phase_total_cyc]
+    call    emit_hex_u64
+
+    mov     eax, 0x3D6E7420           ; " tn="
+    mov     [rdi], eax
+    add     rdi, 4
+    mov     rax, [rel phase_total_cnt]
+    call    emit_hex_u64
+
+    mov     byte [rdi], 10            ; '\n'
+    inc     rdi
+
+    ; write(2, rsp, rdi - rsp)
+    mov     rdx, rdi
+    sub     rdx, rsp
+    mov     rsi, rsp
+    mov     edi, 2
+    syscall0 SYS_write
+
+    add     rsp, 296
+    ret
+
 ; ---- _start ---------------------------------------------------------------
 ; Entry: rsp → argc, then argv[0..argc-1], NULL, envp[..], NULL.
 ;   argv[1]: UDS path (required)
@@ -2000,6 +1797,15 @@ _start:
     ; refuses; ignored so the server still starts without elevated caps.
     mov     edi, MCL_CURRENT | MCL_FUTURE
     syscall0 SYS_mlockall
+
+    ; Hint THP to back the 4.2 MB conn_state region with 2 MB hugepages.
+    ; Reduces dTLB pressure on the per-fd state lookups (1024 4K pages →
+    ; 2-3 hugepage entries).  Best-effort: kernel may decline if THP is
+    ; disabled or fragmentation prevents collapse — return value ignored.
+    lea     rdi, [conn_state]
+    mov     esi, MAX_FDS * STATE_SIZE
+    mov     edx, MADV_HUGEPAGE
+    syscall0 SYS_madvise
 
     ; Promote this thread to SCHED_FIFO so an inbound packet wakes us above
     ; any SCHED_OTHER context (client, softirq).  Best-effort: needs CAP_SYS_NICE
@@ -2056,43 +1862,74 @@ _start:
     call    warm_index
     call    warm_handle_request
 
+    ; Reset instrumentation counters so the first STATS dump reflects only
+    ; live traffic (the 1000 warm POSTs above would otherwise dominate the
+    ; first 1024-bucket sample).
+    xor     eax, eax
+    mov     [rel phase_parse_cyc],  rax
+    mov     [rel phase_parse_cnt],  rax
+    mov     [rel phase_fp_cyc],     rax
+    mov     [rel phase_fp_cnt],     rax
+    mov     [rel phase_vec_cyc],    rax
+    mov     [rel phase_vec_cnt],    rax
+    mov     [rel phase_search_cyc], rax
+    mov     [rel phase_search_cnt], rax
+    mov     [rel phase_send_cyc],   rax
+    mov     [rel phase_send_cnt],   rax
+    mov     [rel phase_recvmsg_cnt],rax
+    mov     [rel phase_recvfrom_cnt],rax
+    mov     [rel phase_total_cyc],  rax
+    mov     [rel phase_total_cnt],  rax
+
     mov     rdi, r14
     call    bind_control_uds
     test    eax, eax
     js      .fail_bind
     mov     [ctrl_fd], eax
 
-    ; io_uring path (multishot accept + multishot recv + provided buffer
-    ; ring + registered files).
-    lea     rdi, [g_ring]
-    mov     esi, 256
-    call    uring_init
-    test    eax, eax
-    js      .fail_bind
-
-    mov     eax, [ctrl_fd]
-    mov     [reg_files + API_REG_CTRL_IDX*4], eax
-    lea     rdi, [g_ring]
-    lea     rsi, [reg_files]
-    mov     edx, 1
-    call    uring_register_files
-    test    eax, eax
-    js      .fail_bind
-
-    call    init_buf_ring
-    test    eax, eax
-    js      .fail_bind
-
-    ; Kernel busy-poll NAPI on the ring — 50 µs budget, best-effort.  Cuts
-    ; the NIC → user wake-up latency for short windows where recv lands
-    ; right after a previous CQE was reaped.  100µs was tried and regressed
-    ; (over-polled, ate CPU budget).  Silently ignored on kernels &lt; 6.9.
-    lea     rdi, [g_ring]
-    mov     esi, 50
-    call    uring_register_napi
-
+    ; Make ctrl_fd non-blocking so the edge-triggered drain in
+    ; handle_ctrl_event terminates on EAGAIN rather than blocking the
+    ; whole event loop.
     mov     edi, [ctrl_fd]
-    call    server_loop_uring
+    mov     esi, F_SETFL
+    mov     edx, O_NONBLOCK
+    syscall0 SYS_fcntl
+
+    ; epoll setup
+    mov     edi, EPOLL_CLOEXEC
+    syscall0 SYS_epoll_create1
+    test    eax, eax
+    js      .fail_bind
+    mov     [epoll_fd], eax
+
+    ; ioctl(epfd, EPIOCSPARAMS, &epoll_busy_params)  [Linux 6.9+, best-effort].
+    ; Tells the kernel to NAPI-busy-poll for 50µs inside every epoll_wait
+    ; before sleeping.  Failure (ENOTTY on pre-6.9 or EINVAL) is harmless —
+    ; we just fall back to standard wake semantics.
+    mov     edi, [epoll_fd]
+    mov     esi, EPIOCSPARAMS
+    lea     rdx, [epoll_busy_params]
+    syscall0 SYS_ioctl
+
+    sub     rsp, 16
+    ; Level-triggered (no EPOLLET): the busy-poll spin in server_loop_epoll
+    ; samples epoll_wait every ~200 ns, so any buffered data is observed on
+    ; the immediate next poll — eliminating the need for drain-until-EAGAIN
+    ; loops in handle_ctrl_event / handle_client_event (saves 1-2 syscalls
+    ; per request that just returned EAGAIN anyway).
+    mov     dword [rsp + 0], EPOLLIN
+    mov     eax, [ctrl_fd]
+    mov     [rsp + 4], eax
+    mov     edi, [epoll_fd]
+    mov     esi, EPOLL_CTL_ADD
+    mov     edx, eax
+    lea     r10, [rsp + 0]
+    syscall0 SYS_epoll_ctl
+    add     rsp, 16
+    test    eax, eax
+    js      .fail_bind
+
+    call    server_loop_epoll
 
     xor     edi, edi
     syscall0 SYS_exit_group

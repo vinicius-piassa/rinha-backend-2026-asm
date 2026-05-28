@@ -24,15 +24,9 @@ default rel
 
 %include "syscalls.inc"
 %include "macros.inc"
-%include "uring.inc"
-
-extern uring_init
-extern uring_submit_and_wait
-extern uring_register_files
-extern uring_register_napi
 
 %define MAX_BACKENDS    8
-%define MAX_EVENTS      64
+%define MAX_EVENTS      128
 %define EPOLL_EV_SIZE   12
 %define EPOLL_EV_FD     4
 %define BACKEND_RETRIES 50
@@ -67,6 +61,16 @@ warm_body_len      equ warm_http_end - warm_body
     %error "warm_body_len != 407 — update the Content-Length header"
 %endif
 
+; epoll_params struct for EPIOCSPARAMS ioctl (Linux 6.9+).  Same rationale
+; as in server.asm: turns our spin-on-epoll_wait(0) into a single syscall
+; whose internal NAPI busy-poll loop catches incoming connections in <50µs.
+align 8
+epoll_busy_params:
+    dd 50                                 ; busy_poll_usecs
+    dw 8                                  ; busy_poll_budget
+    db 1                                  ; prefer_busy_poll
+    db 0                                  ; __pad
+
 ; ===========================================================================
 section .bss
 alignb 8
@@ -75,53 +79,9 @@ backend_paths:  resq MAX_BACKENDS
 backend_count:  resd 1
 rr_cursor:      resd 1
 tcp_listen_fd:  resd 1
-epoll_fd:       resd 1                          ; unused now (gc-sectioned)
-events_buf:     resb MAX_EVENTS * EPOLL_EV_SIZE ; unused now
-
-alignb 64
-g_ring:         resb URING_SIZE
-
-; Registered file table.  Index 0 = tcp_listen_fd; indices 1..N = backends_fd.
-; Once registered with IORING_REGISTER_FILES, SQEs reference these slots via
-; IOSQE_FIXED_FILE + slot index, which skips the per-syscall fd→struct file
-; resolution in the kernel (~100-200 ns saved per submit).
-%define REG_LISTEN_IDX   0
-%define REG_BACKENDS_BASE 1
-alignb 4
-reg_files:      resd (MAX_BACKENDS + 1)
-
-; Pool of sendmsg payload structures, cycled round-robin so the kernel can
-; consume each one before we overwrite it.  Each 128-byte entry packs:
-;   +0   iobuf  (1 used + 7 pad)
-;   +8   iovec  (struct iovec, 16 B)
-;   +24  cmsg   (CMSG_SPACE(sizeof(int)) = 24 B for one fd)
-;   +48  msghdr (56 B)
-;   +104 pad
-; SQ size is 1024 (lb_loop_uring init); each accept consumes up to 2 SQEs
-; (sendmsg + close), so worst-case ~512 sendmsg SQEs can be in-flight
-; concurrently reading their msghdr/iov/cmsg from the pool.  Pool must be at
-; least that big to avoid the kernel reading a recycled entry under bursty
-; accept traffic.  512 * 128 = 64 KB — trivial.
-%define MSGPOOL_SIZE     512                 ; power of 2; ≥ SQ_SIZE/2
-%define MSGPOOL_MASK     (MSGPOOL_SIZE - 1)
-%define MSGPOOL_ENTRY    128
-%define MSGPOOL_BYTES    (MSGPOOL_SIZE * MSGPOOL_ENTRY)
-%define MP_IOBUF_OFF     0
-%define MP_IOV_OFF       8
-%define MP_CMSG_OFF      24
-%define MP_MSGHDR_OFF    48
-alignb 64
-msgpool:        resb MSGPOOL_BYTES
-msgpool_cursor: resd 1
-
-; Consecutive sendmsg/close error count (errors silenced via CQE_SKIP_SUCCESS
-; surface here when the kernel sends a CQE for the failed op).  Reset on
-; success path is impractical (success CQEs are suppressed), so we treat
-; this as a sticky fault counter — once it exceeds the threshold we exit so
-; the container supervisor (docker compose restart_policy) brings us back up
-; instead of silently round-robin-ing onto a dead backend forever.
-sendmsg_err_count: resd 1
-%define SENDMSG_ERR_LIMIT 256
+epoll_fd:       resd 1
+alignb 16
+events_buf:     resb MAX_EVENTS * EPOLL_EV_SIZE
 
 ; ===========================================================================
 section .text
@@ -190,6 +150,48 @@ listen_tcp:
     mov     edi, ebx
     mov     esi, SOL_TCP
     mov     edx, TCP_DEFER_ACCEPT
+    lea     r10, [rsp + 16]
+    mov     r8d, 4
+    syscall0 SYS_setsockopt
+
+    ; SO_BUSY_POLL — per-socket NAPI busy-poll usecs.  Complements the
+    ; EPIOCSPARAMS we set on the epoll; this one applies to socket-level
+    ; ops (the accept_loop's accept4 path).  Best-effort.
+    mov     dword [rsp + 16], 50
+    mov     edi, ebx
+    mov     esi, SOL_SOCKET
+    mov     edx, SO_BUSY_POLL
+    lea     r10, [rsp + 16]
+    mov     r8d, 4
+    syscall0 SYS_setsockopt
+
+    ; SO_PREFER_BUSY_POLL = 1 (Linux 5.7+).  Tells the kernel to favour the
+    ; busy-poll path over interrupt-driven wake.
+    mov     dword [rsp + 16], 1
+    mov     edi, ebx
+    mov     esi, SOL_SOCKET
+    mov     edx, SO_PREFER_BUSY_POLL
+    lea     r10, [rsp + 16]
+    mov     r8d, 4
+    syscall0 SYS_setsockopt
+
+    ; SO_BUSY_POLL_BUDGET = 8 (Linux 5.7+).  Max packets handled per
+    ; busy-poll round; mirrors the EPIOCSPARAMS budget.
+    mov     dword [rsp + 16], 8
+    mov     edi, ebx
+    mov     esi, SOL_SOCKET
+    mov     edx, SO_BUSY_POLL_BUDGET
+    lea     r10, [rsp + 16]
+    mov     r8d, 4
+    syscall0 SYS_setsockopt
+
+    ; TCP_FASTOPEN = 256 (server-side TFO queue length).  Lets clients
+    ; that support TFO skip the initial RTT by stuffing payload into the
+    ; SYN.  k6 may or may not enable client-side TFO — best-effort.
+    mov     dword [rsp + 16], 256
+    mov     edi, ebx
+    mov     esi, SOL_TCP
+    mov     edx, TCP_FASTOPEN
     lea     r10, [rsp + 16]
     mov     r8d, 4
     syscall0 SYS_setsockopt
@@ -390,23 +392,12 @@ accept_loop:
     js      .check_err
     mov     ebx, eax
 
-    mov     dword [rsp + 0], 1
-
-    ; TCP_NODELAY  (syscall arg4 → r10, not rcx)
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_NODELAY
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-
-    ; TCP_QUICKACK
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_QUICKACK
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
+    ; (Previously: setsockopt(TCP_NODELAY) + setsockopt(TCP_QUICKACK) per
+    ;  accept.  Both are no-ops in our req/resp pattern: response always
+    ;  piggybacks the ACK of the inbound POST, so server-side has no
+    ;  unACKed segments when sending — Nagle never engages, delayed-ACK
+    ;  never fires standalone.  Removing the two setsockopt syscalls
+    ;  saves ~50ns/req amortised over keep-alive.)
 
     ; Pick backend: rr_cursor++ % backend_count
     mov     eax, [rr_cursor]
@@ -438,9 +429,16 @@ accept_loop:
 
 ; ---- server_loop ---------------------------------------------------------
 
+; The LB stays on a blocking epoll_wait — its 0.05 cpu cap (5% of one
+; core) can't afford the userspace busy-poll spin that the APIs use.
+; A 50 µs spin window × 5k accept events/sec would consume ~27% CPU and
+; trigger CFS throttling that backs up the accept queue.
+
 server_loop:
-    push    rbx                          ; n events
-    sub     rsp, 8
+    push    rbx                          ; n events (callee-save)
+    push    r12                          ; ev iter index (callee-save — survives
+                                         ; syscalls inside accept_loop that clobber rcx)
+                                         ; 2 pushes → rsp 0 mod 16 ✓
 
 .outer:
     mov     edi, [epoll_fd]
@@ -452,12 +450,12 @@ server_loop:
     js      .check_eintr
 
     mov     ebx, eax
-    xor     ecx, ecx
+    xor     r12d, r12d
 .ev_loop:
-    cmp     ecx, ebx
+    cmp     r12d, ebx
     jge     .outer
 
-    movsxd  rax, ecx
+    movsxd  rax, r12d
     imul    rax, rax, EPOLL_EV_SIZE
     lea     rdx, [events_buf]
     mov     edi, [rdx + rax + EPOLL_EV_FD]
@@ -467,325 +465,16 @@ server_loop:
     call    accept_loop
 
 .next:
-    inc     ecx
+    inc     r12d
     jmp     .ev_loop
 
 .check_eintr:
     cmp     rax, -EINTR
     je      .outer
-    add     rsp, 8
+    pop     r12
     pop     rbx
     ret
 
-; ===========================================================================
-; io_uring helpers — local to the LB.  Same shape as the server's helpers
-; but operate against the LB's own g_ring.  No state machine per accept;
-; we just submit sendmsg→close (hardlinked) and bounce.
-; ===========================================================================
-
-; ---- get_next_sqe (LB private) -------------------------------------------
-; rax = next free SQE pointer; rax = 0 if SQ full.  Pure compute.
-
-lb_get_next_sqe:
-    mov     eax, [g_ring + URING_SQ_TAIL_CACHED]
-    mov     rcx, [g_ring + URING_SQ_HEAD]
-    mov     edx, [rcx]
-    mov     ecx, eax
-    sub     ecx, edx
-    cmp     ecx, [g_ring + URING_SQ_MASK]
-    ja      .full
-    mov     ecx, eax
-    and     ecx, [g_ring + URING_SQ_MASK]
-    shl     ecx, SQE_SHIFT
-    mov     rdx, [g_ring + URING_SQES]
-    lea     rax, [rdx + rcx]
-    inc     dword [g_ring + URING_SQ_TAIL_CACHED]
-    ret
-.full:
-    xor     eax, eax
-    ret
-
-; ---- msgpool_init --------------------------------------------------------
-; One-shot at LB start.  Walks every msgpool entry and pre-fills the
-; pointer / length fields that never change across requests, so the
-; per-request fast path only writes the client_fd into the cmsg payload
-; and the destination uds_fd into the SQE.
-
-msgpool_init:
-    xor     ecx, ecx
-.loop:
-    cmp     ecx, MSGPOOL_SIZE
-    jge     .done
-    ; entry = msgpool + ecx*MSGPOOL_ENTRY
-    mov     eax, ecx
-    shl     eax, 7                        ; * 128
-    lea     rdi, [msgpool]
-    add     rdi, rax                      ; entry base
-
-    ; iobuf[0] = 'F'
-    mov     byte [rdi + MP_IOBUF_OFF], 'F'
-
-    ; iov = { &iobuf, 1 }
-    lea     rax, [rdi + MP_IOBUF_OFF]
-    mov     [rdi + MP_IOV_OFF + 0], rax
-    mov     qword [rdi + MP_IOV_OFF + 8], 1
-
-    ; cmsg header (cmsg_len = 20, level = SOL_SOCKET, type = SCM_RIGHTS).
-    ; Payload (fd) and the 4-byte alignment tail are filled per request.
-    mov     qword [rdi + MP_CMSG_OFF + 0], 20
-    mov     dword [rdi + MP_CMSG_OFF + 8], SOL_SOCKET
-    mov     dword [rdi + MP_CMSG_OFF + 12], SCM_RIGHTS
-    mov     dword [rdi + MP_CMSG_OFF + 16], 0
-    mov     dword [rdi + MP_CMSG_OFF + 20], 0
-
-    ; msghdr = { name=0, namelen=0, iov=&iov, iovlen=1, ctrl=&cmsg,
-    ;            ctrllen=24, msg_flags=0 }
-    mov     qword [rdi + MP_MSGHDR_OFF + 0], 0
-    mov     qword [rdi + MP_MSGHDR_OFF + 8], 0   ; namelen + pad
-    lea     rax, [rdi + MP_IOV_OFF]
-    mov     [rdi + MP_MSGHDR_OFF + 16], rax
-    mov     qword [rdi + MP_MSGHDR_OFF + 24], 1
-    lea     rax, [rdi + MP_CMSG_OFF]
-    mov     [rdi + MP_MSGHDR_OFF + 32], rax
-    mov     qword [rdi + MP_MSGHDR_OFF + 40], 24
-    mov     qword [rdi + MP_MSGHDR_OFF + 48], 0
-
-    inc     ecx
-    jmp     .loop
-.done:
-    ret
-
-; ---- arm_accept ----------------------------------------------------------
-; Posts a *multishot* accept against the registered tcp_listen_fd (file slot
-; REG_LISTEN_IDX).  One SQE keeps generating CQEs for every incoming TCP
-; connection until the kernel clears IORING_CQE_F_MORE — at which point the
-; CQE handler re-arms.  Combined with IOSQE_FIXED_FILE, this is one of the
-; biggest single wins of Nível 3: zero SQE submission per accept on the
-; steady state, and the kernel skips fd→struct file lookup.
-
-arm_accept:
-    call    lb_get_next_sqe
-    test    rax, rax
-    jz      .nosqe
-
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_ACCEPT
-    mov     byte [rax + SQE_FLAGS], IOSQE_FIXED_FILE
-    mov     word [rax + SQE_IOPRIO], IORING_ACCEPT_MULTISHOT
-    mov     dword [rax + SQE_FD], REG_LISTEN_IDX
-    mov     dword [rax + SQE_OP_FLAGS], SOCK_CLOEXEC
-    ; user_data = UD_OP_ACCEPT | REG_LISTEN_IDX
-    mov     rdx, UD_OP_ACCEPT
-    or      rdx, REG_LISTEN_IDX
-    mov     [rax + SQE_USER_DATA], rdx
-.nosqe:
-    ret
-
-; ---- handle_accept_cqe ---------------------------------------------------
-; A new client TCP connection has been accepted.  Configure TCP_NODELAY +
-; TCP_QUICKACK on the fd (synchronous setsockopt — ~100 ns each), then
-; submit sendmsg(SCM_RIGHTS, fd) hardlinked to close(fd) so the LB drops
-; its local copy regardless of sendmsg's success.
-;
-;   edi = new client fd (from cqe.res)
-;   r8d = cqe.flags (used only to decide whether to re-arm accept)
-
-handle_accept_cqe:
-    push    rbx                          ; client_fd
-    push    rbp                          ; saved cqe flags
-    sub     rsp, 24                       ; 4 (optval) + scratch + pad
-
-    mov     ebx, edi
-    mov     ebp, r8d
-
-    test    ebx, ebx
-    js      .recheck_more                ; negative result → some error
-
-    ; --- setsockopt TCP_NODELAY + TCP_QUICKACK (synchronous; ~100 ns each)
-    mov     dword [rsp + 0], 1
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_NODELAY
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-
-    mov     edi, ebx
-    mov     esi, SOL_TCP
-    mov     edx, TCP_QUICKACK
-    lea     r10, [rsp + 0]
-    mov     r8d, 4
-    syscall0 SYS_setsockopt
-
-    ; SO_BUSY_POLL on this fd was a no-op: LB never recv()s the accepted
-    ; client socket — it sends it via SCM_RIGHTS and closes its copy.  The
-    ; busy-poll property does NOT propagate through fd-passing in a way that
-    ; benefits the receiver, so the option was 600 ns of dead syscall per
-    ; accept.  The API gets busy-poll via IORING_REGISTER_NAPI on its uring
-    ; instead, which is the kernel-supported path.
-
-    ; --- pick a msgpool entry: idx = msgpool_cursor++ & MASK
-    mov     eax, [msgpool_cursor]
-    inc     dword [msgpool_cursor]
-    and     eax, MSGPOOL_MASK
-    shl     eax, 7                        ; * 128
-    lea     r9, [msgpool]
-    add     r9, rax                       ; entry base in r9
-    mov     dword [r9 + MP_CMSG_OFF + 16], ebx ; payload = client_fd
-
-    ; --- pick a backend: rr_cursor++ % backend_count → registered file index
-    mov     eax, [rr_cursor]
-    inc     dword [rr_cursor]
-    xor     edx, edx
-    div     dword [backend_count]
-    add     edx, REG_BACKENDS_BASE        ; registered-file slot index
-    mov     ecx, edx                      ; backend file index
-
-    ; --- submit sendmsg SQE (linked to close)
-    push    rcx                          ; backend file idx
-    push    r9                           ; msgpool entry
-    call    lb_get_next_sqe
-    pop     r9
-    pop     rcx
-    test    rax, rax
-    jz      .skip_close                  ; SQ full — drop client_fd via blocking close
-
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_SENDMSG
-    mov     byte [rax + SQE_FLAGS], IOSQE_IO_HARDLINK | IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE
-    mov     dword [rax + SQE_FD], ecx     ; registered backend file index
-    lea     rdx, [r9 + MP_MSGHDR_OFF]
-    mov     [rax + SQE_ADDR], rdx
-    mov     dword [rax + SQE_OP_FLAGS], MSG_NOSIGNAL
-    mov     rdx, UD_OP_SENDMSG
-    mov     ecx, ebx
-    or      rdx, rcx                     ; encode client_fd for diagnostics
-    mov     [rax + SQE_USER_DATA], rdx
-
-    ; --- submit close(client_fd) SQE
-    call    lb_get_next_sqe
-    test    rax, rax
-    jz      .rollback_sendmsg            ; close alloc failed after sendmsg
-    SQE_ZERO rax
-    mov     byte [rax + SQE_OPCODE], IORING_OP_CLOSE
-    mov     byte [rax + SQE_FLAGS], IOSQE_CQE_SKIP_SUCCESS
-    mov     dword [rax + SQE_FD], ebx
-    mov     rdx, UD_OP_CLOSE
-    mov     ecx, ebx
-    or      rdx, rcx
-    mov     [rax + SQE_USER_DATA], rdx
-
-.recheck_more:
-    ; Multishot accept: kernel keeps the SQE armed and clears CQE_F_MORE only
-    ; when it stops (e.g., on cancellation or fatal listen-fd error).  Re-arm
-    ; only in that case; the steady state pays zero submission cost.
-    test    ebp, IORING_CQE_F_MORE
-    jnz     .ret
-    call    arm_accept
-
-.ret:
-    add     rsp, 24
-    pop     rbp
-    pop     rbx
-    ret
-
-.skip_close:
-    ; sendmsg SQE alloc itself failed: no rollback needed.  Blocking-close
-    ; the fd locally so we never leak; the client just sees a connection
-    ; drop, which is the correct behaviour under SQ exhaustion.
-    mov     edi, ebx
-    syscall0 SYS_close
-    jmp     .recheck_more
-
-.rollback_sendmsg:
-    ; Close SQE alloc failed AFTER the sendmsg SQE was already filled in.
-    ; The sendmsg has IOSQE_IO_HARDLINK set — if we just leave it, when the
-    ; ring is later submitted its link target becomes whatever SQE happens
-    ; to be allocated next (from arm_accept or another accept handler),
-    ; corrupting that chain.  Undo by decrementing the cached tail so the
-    ; sendmsg SQE is treated as never having been emitted.  Then blocking-
-    ; close the client fd.
-    dec     dword [g_ring + URING_SQ_TAIL_CACHED]
-    mov     edi, ebx
-    syscall0 SYS_close
-    jmp     .recheck_more
-
-; ---- lb_loop_uring -------------------------------------------------------
-; Single-thread event loop.  Drains all visible CQEs, then submits +
-; blocks via uring_submit_and_wait.  Never returns under normal operation.
-
-lb_loop_uring:
-    push    rbx                          ; cqe iterator
-    push    rbp                          ; cq tail
-    push    r12                          ; cqes base
-    push    r13                          ; cq mask
-    push    r14                          ; cq head ptr
-    push    r15                          ; unused
-    sub     rsp, 8
-
-    call    arm_accept
-
-.outer:
-    mov     r14, [g_ring + URING_CQ_HEAD]
-    mov     ebx, [r14]
-    mov     rax, [g_ring + URING_CQ_TAIL]
-    mov     ebp, [rax]
-    cmp     ebx, ebp
-    je      .submit_wait
-
-    mov     r12, [g_ring + URING_CQES]
-    mov     r13d, [g_ring + URING_CQ_MASK]
-
-.cqe_loop:
-    cmp     ebx, ebp
-    je      .drained
-
-    mov     eax, ebx
-    and     eax, r13d
-    shl     eax, CQE_SHIFT
-    lea     rcx, [r12 + rax]
-
-    mov     rax, [rcx + CQE_USER_DATA]
-    mov     esi, [rcx + CQE_RES]
-    mov     r8d, [rcx + CQE_FLAGS]
-    mov     edi, eax                      ; arg1: fd (low 32) — for handlers
-    shr     rax, 32                       ; op
-
-    cmp     eax, UD_OP_ACCEPT >> UD_OP_SHIFT
-    je      .h_accept
-    ; UD_OP_SENDMSG / UD_OP_CLOSE only fire on errors (we set CQE_SKIP_SUCCESS).
-    ; Close errors are benign (peer RST, double-close races) — silently drop.
-    ; Only sendmsg failures indicate a dead API ctrl_fd; count those toward
-    ; the exit budget.  Limit raised to 256 to absorb transient kernel noise
-    ; over a multi-million-accept run without spurious exits.
-    test    esi, esi
-    jns     .next                        ; res >= 0: not an error, ignore
-    cmp     eax, UD_OP_SENDMSG >> UD_OP_SHIFT
-    jne     .next                        ; only sendmsg errors count
-    inc     dword [sendmsg_err_count]
-    cmp     dword [sendmsg_err_count], SENDMSG_ERR_LIMIT
-    jb      .next
-    ; Exhausted error budget — exit so the supervisor restarts us.
-    mov     edi, 2
-    syscall0 SYS_exit_group
-
-.h_accept:
-    ; For accept, cqe.res IS the new client fd.  Override rdi with res.
-    mov     edi, esi
-    call    handle_accept_cqe
-
-.next:
-    inc     ebx
-    jmp     .cqe_loop
-
-.drained:
-    mov     [r14], ebx
-
-.submit_wait:
-    lea     rdi, [g_ring]
-    mov     esi, 1
-    call    uring_submit_and_wait
-    jmp     .outer
 
 ; ---- self_warm_child ------------------------------------------------------
 ; Runs only in the child of spawn_self_warm.  Opens N short TCP connections
@@ -996,48 +685,41 @@ _start:
     jmp     .cb_loop
 .cb_done:
 
-    ; io_uring path (multishot accept + registered files + linked
-    ; sendmsg→close).
-    ; SQ size 1024: each accept consumes 2 SQEs (sendmsg + close) plus the
-    ; multishot accept itself.  Bursts of ~100 concurrent accepts can pile
-    ; up enough in-flight ops to overflow a 256-slot ring, falling back to
-    ; the synchronous-close path (lb.asm:.skip_close) which shows up as p99
-    ; spikes.  1024 gives 4× headroom; SQ memory cost is trivial (~24 KB).
-    lea     rdi, [g_ring]
-    mov     esi, 1024
-    call    uring_init
+    ; epoll path: single-thread event loop driving accept4 → send_fd → close.
+    ;   1) epoll_create1(EPOLL_CLOEXEC)
+    ;   2) epoll_ctl(ADD, tcp_listen_fd, EPOLLIN | EPOLLET)
+    ;      Edge-triggered + nonblocking listen socket → accept_loop drains
+    ;      until EAGAIN every wake-up.  No multishot accept here (would need
+    ;      io_uring); the cost is one extra epoll_wait return per burst.
+    mov     edi, EPOLL_CLOEXEC
+    syscall0 SYS_epoll_create1
     test    eax, eax
     js      .fail_listen
+    mov     [epoll_fd], eax
 
-    call    msgpool_init
+    ; ioctl(epfd, EPIOCSPARAMS, &epoll_busy_params)  [Linux 6.9+, best-effort].
+    mov     edi, [epoll_fd]
+    mov     esi, EPIOCSPARAMS
+    lea     rdx, [epoll_busy_params]
+    syscall0 SYS_ioctl
 
+    sub     rsp, 16
+    mov     dword [rsp + 0], EPOLLIN | EPOLLET
     mov     eax, [tcp_listen_fd]
-    mov     [reg_files + REG_LISTEN_IDX*4], eax
-    xor     ecx, ecx
-.rf_copy:
-    cmp     ecx, [backend_count]
-    jge     .rf_done
-    mov     eax, [backends_fd + rcx*4]
-    mov     [reg_files + (REG_BACKENDS_BASE + 0)*4 + rcx*4], eax
-    inc     ecx
-    jmp     .rf_copy
-.rf_done:
-    lea     rdi, [g_ring]
-    lea     rsi, [reg_files]
-    mov     edx, MAX_BACKENDS + 1
-    call    uring_register_files
+    mov     [rsp + 4], eax                ; data.fd at offset 4 of epoll_event
+    mov     edi, [epoll_fd]
+    mov     esi, EPOLL_CTL_ADD
+    mov     edx, eax
+    lea     r10, [rsp + 0]
+    syscall0 SYS_epoll_ctl
+    add     rsp, 16
     test    eax, eax
     js      .fail_listen
-
-    ; Kernel busy-poll NAPI on the ring (50 µs budget).  Best-effort.
-    lea     rdi, [g_ring]
-    mov     esi, 50
-    call    uring_register_napi
 
     mov     edi, r13d
     call    spawn_self_warm
 
-    call    lb_loop_uring
+    call    server_loop
 
     xor     edi, edi
     syscall0 SYS_exit_group

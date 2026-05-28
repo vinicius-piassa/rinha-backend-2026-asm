@@ -6,3 +6,5 @@ asm/build/
 *.swp
 .DS_Store
 .claude/
+compose.*.yml
+/baseline/

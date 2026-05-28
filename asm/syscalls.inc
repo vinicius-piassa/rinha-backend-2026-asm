@@ -144,8 +144,11 @@
 %define SO_REUSEPORT          15
 %define SO_INCOMING_CPU       49
 %define SO_BUSY_POLL          46
+%define SO_PREFER_BUSY_POLL   69       ; Linux 5.7+ — prefer NAPI busy poll
+%define SO_BUSY_POLL_BUDGET   70       ; Linux 5.7+ — packet budget per call
 %define TCP_DEFER_ACCEPT      9
 %define TCP_NOTSENT_LOWAT     25
+%define TCP_FASTOPEN          23       ; Linux 3.7+ — server-side accept queue
 %define SOL_TCP               6
 %define TCP_NODELAY           1
 %define TCP_QUICKACK          12
@@ -165,6 +168,16 @@
 %define EPOLL_CTL_DEL         2
 %define EPOLL_CTL_MOD         3
 %define EPOLL_CLOEXEC         0x80000
+
+; EPIOCSPARAMS — set epoll busy-poll parameters (Linux 6.9+).
+; _IOW('p', 0x01, sizeof(struct epoll_params)=8):
+;   (1<<30) | (8<<16) | ('p'<<8) | 0x01 = 0x40087001.
+; Struct layout (8 bytes):
+;   u32 busy_poll_usecs   — microseconds the kernel busy-polls inside epoll_wait
+;   u16 busy_poll_budget  — max NAPI poll packets per call
+;   u8  prefer_busy_poll  — 1 to prefer busy poll over standard sleep
+;   u8  __pad
+%define EPIOCSPARAMS          0x40087001
 
 %define PROT_READ             1
 %define PROT_WRITE            2
