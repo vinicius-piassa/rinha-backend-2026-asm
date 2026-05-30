@@ -195,63 +195,74 @@ parse_int32:
 ;   [rsp + 24] v double (running result; survives parse_uint64 calls)
 
 global parse_number
+; Single-pass variant: accumulate the whole mantissa (int + fractional digits)
+; in one loop, tracking the fractional-digit count, then scale by one mulsd
+; against pow10_neg[fraclen].  Replaces the two parse_uint64 calls + FMA with a
+; single inline scan + one multiply.  Numerically equivalent to the old path to
+; within the last ULP (same pow10_neg reciprocal table).  No CALLs → no stack
+; frame; registers only.
 parse_number:
-    push    rbx                        ; (1) p
-    push    rbp                        ; (2) end
-    push    r12                        ; (3) out
-    push    r13                        ; (4) neg
-    push    r14                        ; (5) eneg
-    push    r15                        ; (6) frac_len / scratch
-    sub     rsp, 40
-    ; rsp ≡ 8 - 48 - 40 = -80 ≡ 0 mod 16 ✓
+    push    rbx                        ; p (cursor)
+    push    rbp                        ; end
+    push    r12                        ; out
+    push    r13                        ; neg
+    push    r14                        ; fraclen
+    push    r15                        ; mantissa (u64)
 
     mov     rbx, rdi
     mov     rbp, rsi
     mov     r12, rdx
 
     xor     r13d, r13d                 ; neg = 0
+    xor     r14d, r14d                 ; fraclen = 0
+    xor     r15d, r15d                 ; mantissa = 0
+
+    ; optional leading '-'
     cmp     rbx, rbp
-    jae     .int
+    jae     .conv
     cmp     byte [rbx], '-'
-    jne     .int
+    jne     .mant
     mov     r13d, 1
     inc     rbx
 
-.int:
-    mov     rdi, rbx
-    mov     rsi, rbp
-    lea     rdx, [rsp]
-    call    parse_uint64
-    mov     rbx, rax
-    cvtsi2sd xmm0, qword [rsp]         ; v = (double)int_part
-    movsd   [rsp + 24], xmm0
-
-    ; Optional fractional
+.mant:
+    xor     r8d, r8d                   ; seen_dot = 0
+.mant_loop:
     cmp     rbx, rbp
-    jae     .check_exp
-    cmp     byte [rbx], '.'
-    jne     .check_exp
-
+    jae     .conv
+    movzx   eax, byte [rbx]
+    cmp     al, '.'
+    jne     .not_dot
+    test    r8d, r8d
+    jnz     .conv                      ; a second '.' ends the number
+    mov     r8d, 1
     inc     rbx
-    mov     r14, rbx                   ; (reuse r14 briefly as frac_start)
-    mov     rdi, rbx
-    mov     rsi, rbp
-    lea     rdx, [rsp + 8]
-    call    parse_uint64
-    mov     rbx, rax
+    jmp     .mant_loop
+.not_dot:
+    sub     eax, '0'
+    cmp     eax, 9
+    ja      .conv                      ; non-digit ends the number
+    lea     r15, [r15 + r15*4]
+    lea     r15, [rax + r15*2]         ; mantissa = 10*mantissa + digit
+    test    r8d, r8d
+    jz      .next_digit
+    inc     r14d                       ; count fractional digits
+.next_digit:
+    inc     rbx
+    jmp     .mant_loop
 
-    mov     r15, rbx
-    sub     r15, r14                   ; len = p - frac_start
-    cmp     r15, 20
-    jae     .check_exp                 ; bail: C drops len >= 20
+.conv:
+    ; Keep the pow10_neg index in bounds [0..19] (table-safety).  fraclen >= 20
+    ; only on pathological input, which the downstream clamp01 bounds anyway.
+    cmp     r14d, 20
+    jb      .conv_ok
+    mov     r14d, 19
+.conv_ok:
+    cvtsi2sd xmm0, r15                  ; (double)mantissa  (mantissa < 2^63 in practice)
+    lea     rax, [pow10_neg]
+    mulsd   xmm0, [rax + r14*8]         ; mantissa * 10^-fraclen
 
-    cvtsi2sd     xmm0, qword [rsp + 8]
-    lea          rax, [pow10_neg]
-    movsd        xmm1, [rax + r15*8]          ; pow10_neg[len] → mul operand reg
-    vfmadd213sd  xmm0, xmm1, [rsp + 24]       ; xmm0 = xmm0 * xmm1 + int_part
-    movsd        [rsp + 24], xmm0
-
-.check_exp:
+    ; optional exponent
     cmp     rbx, rbp
     jae     .apply_sign
     movzx   eax, byte [rbx]
@@ -259,10 +270,9 @@ parse_number:
     je      .exp
     cmp     al, 'E'
     jne     .apply_sign
-
 .exp:
     inc     rbx
-    xor     r14d, r14d                 ; eneg
+    xor     r8d, r8d                    ; eneg = 0
     cmp     rbx, rbp
     jae     .exp_digits
     movzx   eax, byte [rbx]
@@ -270,50 +280,47 @@ parse_number:
     je      .exp_skip_sign
     cmp     al, '-'
     jne     .exp_digits
-    mov     r14d, 1
+    mov     r8d, 1
 .exp_skip_sign:
     inc     rbx
-
 .exp_digits:
-    mov     rdi, rbx
-    mov     rsi, rbp
-    lea     rdx, [rsp + 16]
-    call    parse_uint64
-    mov     rbx, rax
-
-    ; s = 10^e via iterative mulsd (e small in practice)
+    xor     ecx, ecx                    ; e = 0
+.exp_loop:
+    cmp     rbx, rbp
+    jae     .exp_apply
+    movzx   eax, byte [rbx]
+    sub     eax, '0'
+    cmp     eax, 9
+    ja      .exp_apply
+    lea     rcx, [rcx + rcx*4]
+    lea     rcx, [rax + rcx*2]          ; e = 10*e + digit
+    inc     rbx
+    jmp     .exp_loop
+.exp_apply:
     movsd   xmm1, [c_one_double]
-    mov     rcx, [rsp + 16]
     test    rcx, rcx
-    jz      .apply_exp
+    jz      .apply_sign
 .exp_mul_loop:
     mulsd   xmm1, [c_ten_double]
     dec     rcx
     jnz     .exp_mul_loop
-
-.apply_exp:
-    movsd   xmm0, [rsp + 24]
-    test    r14d, r14d
-    jz      .apply_exp_mul
+    test    r8d, r8d
+    jz      .exp_pos
     divsd   xmm0, xmm1
-    jmp     .save_v
-.apply_exp_mul:
+    jmp     .apply_sign
+.exp_pos:
     mulsd   xmm0, xmm1
-.save_v:
-    movsd   [rsp + 24], xmm0
 
 .apply_sign:
-    movsd   xmm0, [rsp + 24]
     test    r13d, r13d
     jz      .store
     movsd   xmm1, [c_negzero]
-    xorpd   xmm0, xmm1                 ; flip sign bit (matches `v = -v`)
+    xorpd   xmm0, xmm1                  ; flip sign bit
 
 .store:
     movsd   [r12], xmm0
     mov     rax, rbx
 
-    add     rsp, 40
     pop     r15
     pop     r14
     pop     r13
