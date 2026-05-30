@@ -22,7 +22,7 @@ services:
       resources:
         limits:
           cpus: "0.475"
-          memory: "171MB"
+          memory: "24MB"
 
   api2:
     <<: *asm
@@ -37,7 +37,7 @@ services:
       resources:
         limits:
           cpus: "0.475"
-          memory: "171MB"
+          memory: "24MB"
 
   lb:
     <<: *asm
