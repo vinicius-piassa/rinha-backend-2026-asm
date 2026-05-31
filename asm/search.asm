@@ -865,10 +865,15 @@ index_open:
     cmp     rax, rcx
     jne     .fail_unmap
 
-    ; Check n_clusters == N_CLUSTERS
+    ; Check 1 <= n_clusters <= N_CLUSTERS.  Adaptive-K indices store any k in
+    ; that range; buffers (SS_CLUSTER_PACKED, bpsoa) are sized for the max, and
+    ; build_bpsoa fills phantom lanes (c >= k) with INT16_MAX/MIN so a non-
+    ; multiple-of-8 k never lets pick_min select a phantom cluster.
     mov     eax, [rbp + 8]
+    test    eax, eax
+    jz      .fail_unmap                  ; k < 1
     cmp     eax, N_CLUSTERS
-    jne     .fail_unmap
+    ja      .fail_unmap                  ; k > N_CLUSTERS
 
     mov     r15d, [rbp + 12]                 ; nv
 

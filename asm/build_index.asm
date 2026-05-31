@@ -439,17 +439,18 @@ kmeans:
     mov     r12, rdx
     mov     r13, rcx
     mov     [rsp + 32], r8d              ; n_iters
+    mov     [rsp + 48], r9d              ; k (cluster count; stashed — l2sq calls clobber r9)
 
-    ; --- init centroids: step = n / N_CLUSTERS --------------------------
+    ; --- init centroids: step = n / k -----------------------------------
     mov     rax, rbp
     xor     edx, edx
-    mov     ecx, N_CLUSTERS
+    mov     ecx, [rsp + 48]              ; k
     div     rcx
     mov     [rsp + 8], rax               ; step
 
     xor     ecx, ecx
 .init_loop:
-    cmp     ecx, N_CLUSTERS
+    cmp     ecx, [rsp + 48]              ; k
     jge     .init_done
 
     ; src = refs + (c * step) * 64
@@ -519,7 +520,7 @@ kmeans:
 
     mov     r11d, 1
 .assign_c:
-    cmp     r11d, N_CLUSTERS
+    cmp     r11d, [rsp + 48]             ; k
     jge     .assign_i_done
 
     mov     rdi, [rsp + 40]              ; ref_ptr
@@ -590,10 +591,10 @@ kmeans:
     jmp     .acc_loop
 
 .divide:
-    ; for c in 0..K-1: if counts[c] > 0: inv = 1/counts[c]; centroid[d] = sum[d] * inv
+    ; for c in 0..k-1: if counts[c] > 0: inv = 1/counts[c]; centroid[d] = sum[d] * inv
     xor     ecx, ecx
 .div_c:
-    cmp     ecx, N_CLUSTERS
+    cmp     ecx, [rsp + 48]             ; k
     jge     .iter_step
 
     mov     rax, [r15 + rcx*8]           ; counts[c]
@@ -670,11 +671,13 @@ counting_sort_by_cluster:
     mov     r12, rdx
     mov     r13, rcx
     mov     r14, r8
+    ; r9d = k (cluster count). No CALL in this function, so r9 survives
+    ; throughout; used directly as the loop bound below.
 
-    ; Zero cluster_offsets[0..K]
+    ; Zero cluster_offsets[0..k]
     mov     rdi, r12
     xor     eax, eax
-    mov     ecx, N_CLUSTERS + 1
+    lea     ecx, [r9 + 1]                 ; k + 1
     cld
     rep     stosd
 
@@ -692,7 +695,7 @@ counting_sort_by_cluster:
     ; Prefix sum: cluster_offsets[c+1] += cluster_offsets[c]
     xor     ecx, ecx
 .psum:
-    cmp     ecx, N_CLUSTERS
+    cmp     ecx, r9d                     ; k
     jge     .psum_done
     mov     eax, [r12 + rcx*4]
     add     [r12 + rcx*4 + 4], eax
@@ -700,10 +703,10 @@ counting_sort_by_cluster:
     jmp     .psum
 .psum_done:
 
-    ; cursor = copy of cluster_offsets[0..K-1]
+    ; cursor = copy of cluster_offsets[0..k-1]
     mov     rdi, r14
     mov     rsi, r12
-    mov     ecx, N_CLUSTERS
+    mov     ecx, r9d                     ; k
     cld
     rep     movsd
 
@@ -745,12 +748,13 @@ counting_sort_by_cluster:
 
 global bbox_pack
 bbox_pack:
-    ; Snapshot stack args (arg7, arg8) BEFORE the prologue, while their
-    ; offsets are trivially [rsp + 8] / [rsp + 16].  This makes the reader
-    ; immune to future push/sub layout changes.  r10/r11 are caller-saved
-    ; and unused by SysV for the first six arguments, so they're free here.
+    ; Snapshot stack args (arg7, arg8, arg9) BEFORE the prologue, while their
+    ; offsets are trivially [rsp + 8] / [rsp + 16] / [rsp + 24].  This makes the
+    ; reader immune to future push/sub layout changes.  r10/r11/rax are
+    ; caller-saved and unused by SysV for the first six arguments.
     mov     r10, [rsp + 8]                ; pair_arr (arg7)
     mov     r11, [rsp + 16]               ; labels_out (arg8)
+    mov     rax, [rsp + 24]               ; k (arg9)
 
     push    rbx
     push    rbp
@@ -769,6 +773,7 @@ bbox_pack:
 
     mov     [rsp + 0], r10                ; pair_arr ptrs base
     mov     [rsp + 8], r11                ; labels_out
+    mov     [rsp + 48], eax               ; k (cluster count)
 
     ; --- Init bbox per cluster ----
     ; For each c in 0..K-1, set bbox_min lanes 0..13 = INT16_MAX, 14..15 = 0.
@@ -778,7 +783,7 @@ bbox_pack:
     vmovdqu ymm3, [c_bbox_max_init]
     xor     ecx, ecx
 .init_bbox:
-    cmp     ecx, N_CLUSTERS
+    cmp     ecx, [rsp + 48]              ; k
     jge     .init_done
     mov     eax, ecx
     shl     eax, 5                        ; c * 32
@@ -956,10 +961,11 @@ write_padded:
 
 global write_index_bin
 write_index_bin:
-    ; Snapshot stack arg7 (labels) BEFORE the prologue while it sits at
-    ; [rsp+8].  r10 is caller-saved and unused by SysV for the first six
-    ; args, so we park labels there until we have a local slot.
+    ; Snapshot stack args (arg7 labels, arg8 k) BEFORE the prologue while they
+    ; sit at [rsp+8] / [rsp+16].  r10/r11 are caller-saved and unused by SysV
+    ; for the first six args, so we park them there until we have local slots.
     mov     r10, [rsp + 8]                ; labels (arg7)
+    mov     r11, [rsp + 16]               ; k (arg8)
 
     push    rbx                          ; fd
     push    rbp                          ; n (i64 for convenience)
@@ -976,6 +982,7 @@ write_index_bin:
     mov     r14, r8
     mov     r15, r9
     mov     [rsp + 64], r10               ; labels
+    mov     [rsp + 72], r11d              ; k (survives the write_padded calls)
 
     ; --- Header (64 B): magic + n_clusters + n_vectors + zero tail ----
     pxor    xmm0, xmm0
@@ -985,7 +992,8 @@ write_index_bin:
     movdqu  [rsp + 48], xmm0
     mov     rax, 0x5844492D34484E52        ; "RNH4-IDX" little-endian
     mov     [rsp + 0], rax
-    mov     dword [rsp + 8], N_CLUSTERS
+    mov     eax, [rsp + 72]                ; k
+    mov     [rsp + 8], eax                 ; header n_clusters = k
     mov     [rsp + 12], ebp                ; n_vectors
 
     mov     edi, ebx
@@ -995,18 +1003,21 @@ write_index_bin:
     test    eax, eax
     jnz     .fail
 
-    ; --- cluster_offsets ((K+1) * 4 bytes) ----
+    ; --- cluster_offsets ((k+1) * 4 bytes) ----
     mov     edi, ebx
     mov     rsi, r12
-    mov     edx, (N_CLUSTERS + 1) * 4
+    mov     edx, [rsp + 72]               ; k
+    inc     edx
+    shl     edx, 2                        ; (k+1) * 4
     call    write_padded
     test    eax, eax
     jnz     .fail
 
-    ; --- bbox_min (K * 16 * 2 bytes) ----
+    ; --- bbox_min (k * 16 * 2 bytes) ----
     mov     edi, ebx
     mov     rsi, r13
-    mov     edx, N_CLUSTERS * 16 * 2
+    mov     edx, [rsp + 72]               ; k
+    shl     edx, 5                        ; k * 32
     call    write_padded
     test    eax, eax
     jnz     .fail
@@ -1014,7 +1025,8 @@ write_index_bin:
     ; --- bbox_max ----
     mov     edi, ebx
     mov     rsi, r14
-    mov     edx, N_CLUSTERS * 16 * 2
+    mov     edx, [rsp + 72]               ; k
+    shl     edx, 5                        ; k * 32
     call    write_padded
     test    eax, eax
     jnz     .fail
@@ -1313,6 +1325,28 @@ _start:
     call    filter_refs_by_tag
     mov     [rsp + 24], rax              ; n_refs (post-filter)
 
+    ; --- Adaptive cluster count: k = clamp(n / 300, 64, N_CLUSTERS) ---------
+    ; Small partitions want few clusters (phase-1 cost dominates → floor 64);
+    ; large ones want many (per-cluster scan dominates → cap N_CLUSTERS=2048).
+    ; Stashed at [rsp+160] (free slot past out_fd) and threaded into kmeans /
+    ; counting_sort / bbox_pack / write_index_bin.  Exact regardless of k.
+    xor     edx, edx
+    mov     ecx, 300
+    div     rcx                          ; rax = n / 300
+    and     eax, -8                      ; round to multiple of 8 (compute_cluster_packed
+                                         ; / pick_min process 8 clusters per ymm; k must
+                                         ; be 8-aligned, else build_bpsoa's group math and
+                                         ; the packed-array bounds go off by phantom lanes)
+    cmp     eax, 64
+    jae     .k_lo_ok
+    mov     eax, 64
+.k_lo_ok:
+    cmp     eax, N_CLUSTERS
+    jbe     .k_hi_ok
+    mov     eax, N_CLUSTERS
+.k_hi_ok:
+    mov     [rsp + 160], eax             ; k
+
     ; Allocate centroids, assignments, cluster_offsets, order, cursor, bbox_*
     mov     rdi, CENTROIDS_BYTES
     call    mmap_alloc
@@ -1362,34 +1396,41 @@ _start:
 %assign P P+1
 %endrep
 
-    ; --- kmeans(refs, n, centroids, assignments, 20) ----
+    ; --- kmeans(refs, n, centroids, assignments, 20, k) ----
     mov     rdi, [rsp + 16]
     mov     rsi, [rsp + 24]
     mov     rdx, [rsp + 32]
     mov     rcx, [rsp + 40]
     mov     r8d, KMEANS_ITERS
+    mov     r9d, [rsp + 160]             ; k
     call    kmeans
 
-    ; --- counting_sort_by_cluster ----
+    ; --- counting_sort_by_cluster(assignments, n, offsets, order, cursor, k) ----
     mov     rdi, [rsp + 40]
     mov     rsi, [rsp + 24]
     mov     rdx, [rsp + 48]
     mov     rcx, [rsp + 56]
     mov     r8,  [rsp + 64]
+    mov     r9d, [rsp + 160]             ; k
     call    counting_sort_by_cluster
 
-    ; --- bbox_pack(refs, n, order, offsets, bmin, bmax, pair_arr, labels) ----
+    ; --- bbox_pack(refs, n, order, offsets, bmin, bmax, pair_arr, labels, k) ----
     mov     rdi, [rsp + 16]
     mov     rsi, [rsp + 24]
     mov     rdx, [rsp + 56]
     mov     rcx, [rsp + 48]
     mov     r8,  [rsp + 72]
     mov     r9,  [rsp + 80]
-    lea     rax, [rsp + 96]
-    push    qword [rsp + 88]              ; arg8: labels_out  (rsp shifted)
-    push    rax                            ; arg7: pair_arr base
+    ; stack args arg7..arg9: load into regs before pushing (rsp not yet shifted)
+    lea     r10, [rsp + 96]              ; pair_arr base (arg7)
+    mov     r11, [rsp + 88]              ; labels_out (arg8)
+    mov     eax, [rsp + 160]            ; k (arg9)
+    sub     rsp, 8                       ; pad: 3 qword args need 8B for 16-align
+    push    rax                          ; arg9: k
+    push    r11                          ; arg8: labels_out
+    push    r10                          ; arg7: pair_arr base
     call    bbox_pack
-    add     rsp, 16
+    add     rsp, 32
 
     ; --- Open output file ----
     mov     rdi, r15
@@ -1400,16 +1441,17 @@ _start:
     js      .err_open_out
     mov     [rsp + 152], eax              ; out_fd
 
-    ; --- write_index_bin(out_fd, n, offsets, bmin, bmax, pair_arr, labels) ----
+    ; --- write_index_bin(out_fd, n, offsets, bmin, bmax, pair_arr, labels, k) ----
     mov     edi, eax
     mov     esi, [rsp + 24]               ; n (low 32 bits)
     mov     rdx, [rsp + 48]
     mov     rcx, [rsp + 72]
     mov     r8,  [rsp + 80]
     lea     r9,  [rsp + 96]
-    mov     rax, [rsp + 88]               ; labels
-    sub     rsp, 8                        ; align before single-arg push
-    push    rax                           ; arg7: labels
+    mov     rax, [rsp + 88]               ; labels (arg7)
+    mov     r11d, [rsp + 160]             ; k (arg8)
+    push    r11                           ; arg8: k       -> [rsp+16] in callee
+    push    rax                           ; arg7: labels  -> [rsp+8]  in callee
     call    write_index_bin
     add     rsp, 16
 
