@@ -1,5 +1,5 @@
 x-asm: &asm
-  image: ghcr.io/vinicius-piassa/rinha-backend-2026-asm:814cc98
+  image: ghcr.io/vinicius-piassa/rinha-backend-2026-asm:721c3ad
   platform: linux/amd64
   restart: unless-stopped
   ulimits:
@@ -12,6 +12,7 @@ services:
   api1:
     <<: *asm
     cpuset: "0"
+    network_mode: "none"
     command:
       - /asm_server
       - /sockets/api1.sock
@@ -27,6 +28,7 @@ services:
   api2:
     <<: *asm
     cpuset: "1"
+    network_mode: "none"
     command:
       - /asm_server
       - /sockets/api2.sock
